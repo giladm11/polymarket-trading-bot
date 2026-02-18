@@ -7,6 +7,13 @@ Uses BaseStrategy for robust order management.
 2. Places UP/DOWN orders.
 3. Monitors fills -> places auto-sell at 0.99.
 4. Cancels unfilled at end of cycle.
+
+Environment variables:
+  POLY_PRIVATE_KEY       - required
+  ORDER_AMOUNT_USD       - USD per side (default: 5)
+  DRY_RUN                - set to "true" to log orders without submitting (default: false)
+  TELEGRAM_BOT_TOKEN     - Telegram bot token (optional)
+  TELEGRAM_CHAT_ID       - Telegram group/channel chat ID (optional)
 """
 
 import sys
@@ -31,8 +38,11 @@ from examples.strategy_example import BaseStrategy, Position, OrderInfo, Strateg
 # Configuration
 ORDER_PRICE = 0.45
 SELL_PRICE = 0.99
-MARKET_DURATION = 5  # minutes
-SELL_DELAY_SECONDS = 5  # wait after fill before placing sell
+MARKET_DURATION = 5        # minutes
+SELL_DELAY_SECONDS = 5     # wait after fill before placing sell
+
+# Persistent config file (stores runtime-adjustable settings like order size)
+CONFIG_FILE = Path(__file__).parent / "bot_config.json"
 
 # Configure logging
 logging.basicConfig(
@@ -47,22 +57,26 @@ logger = logging.getLogger("BTC_5Min_Strategy")
 # ---------------------------------------------------------------------------
 
 class TelegramNotifier:
-    """Sends messages to a Telegram group via Bot API."""
+    """Sends messages to a Telegram group via Bot API, with command polling."""
 
     def __init__(self, token: str, chat_id: str):
         self.token = token
-        self.chat_id = chat_id
+        self.chat_id = str(chat_id)
         self._base_url = f"https://api.telegram.org/bot{token}"
+        self._last_update_id = 0  # for getUpdates offset
 
-    async def send(self, text: str) -> bool:
-        """Send a message asynchronously (non-blocking)."""
+    # ------------------------------------------------------------------
+    # Sending
+    # ------------------------------------------------------------------
+
+    async def send(self, text: str, chat_id: str = None) -> bool:
+        """Send a message asynchronously."""
         import urllib.request
-        import urllib.parse
         import json
 
         url = f"{self._base_url}/sendMessage"
         payload = json.dumps({
-            "chat_id": self.chat_id,
+            "chat_id": chat_id or self.chat_id,
             "text": text,
             "parse_mode": "HTML",
         }).encode("utf-8")
@@ -79,6 +93,34 @@ class TelegramNotifier:
         except Exception as e:
             logger.warning(f"Telegram send failed: {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # Polling
+    # ------------------------------------------------------------------
+
+    async def get_updates(self) -> list:
+        """Fetch new updates from Telegram."""
+        import urllib.request
+        import json
+
+        # URL-encode the allowed_updates array to avoid f-string quote issues
+        url = (
+            self._base_url
+            + "/getUpdates"
+            + "?offset=" + str(self._last_update_id + 1)
+            + "&timeout=1"
+            + "&allowed_updates=%5B%22message%22%5D"
+        )
+        try:
+            resp = await asyncio.to_thread(urllib.request.urlopen, url, timeout=5)
+            data = json.loads(resp.read().decode())
+            updates = data.get("result", [])
+            if updates:
+                self._last_update_id = updates[-1]["update_id"]
+            return updates
+        except Exception as e:
+            logger.debug(f"Telegram getUpdates failed: {e}")
+            return []
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +151,17 @@ class Btc5MinStrategy(BaseStrategy):
         else:
             logger.info("Telegram notifications disabled (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set).")
 
+        # Order amount — runtime-adjustable via /setsize, persisted to bot_config.json
+        self.order_amount_usd: float = self._load_config_value("order_amount_usd", float(os.environ.get("ORDER_AMOUNT_USD", "5")))
+
+        # Balance report interval in seconds — runtime-adjustable via /setinterval
+        self.balance_report_interval: float = self._load_config_value("balance_report_interval", 3600.0)
+
+        # Dry-run mode — logs orders without submitting them
+        self.dry_run: bool = os.environ.get("DRY_RUN", "false").lower() in ("true", "1", "yes")
+        if self.dry_run:
+            logger.warning("*** DRY RUN MODE ENABLED — orders will NOT be submitted ***")
+
         # Hourly balance reporting
         self._last_balance_report = 0.0
 
@@ -126,6 +179,70 @@ class Btc5MinStrategy(BaseStrategy):
         logger.info(f"Bot started. Skipping current cycle, will enter next one after {datetime.fromtimestamp(current_window_end)}")
 
     # ------------------------------------------------------------------
+    # Order placement (dry-run aware)
+    # ------------------------------------------------------------------
+
+    async def place_order(self, token_id: str, price: float, size: float, side: str):
+        """Place an order, or simulate it in dry-run mode."""
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Would place {side} {size} @ {price} (token: {token_id[:16]}...)")
+            # Return a fake successful OrderInfo so the rest of the strategy works normally
+            from examples.strategy_example import OrderInfo
+            fake = OrderInfo(
+                order_id=f"dryrun_{int(time.time() * 1000)}",
+                token_id=token_id,
+                side=side,
+                price=price,
+                size=size,
+                status="pending",
+            )
+            self.orders[fake.order_id] = fake
+            return fake
+        return await super().place_order(token_id=token_id, price=price, size=size, side=side)
+
+    # ------------------------------------------------------------------
+    # Persistent config helpers
+    # ------------------------------------------------------------------
+
+    def _load_config_value(self, key: str, default):
+        """Load a single value from bot_config.json, falling back to default."""
+        import json
+        try:
+            if CONFIG_FILE.exists():
+                data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                if key in data:
+                    value = type(default)(data[key])
+                    logger.info(f"Loaded {key}={value} from {CONFIG_FILE.name}")
+                    return value
+        except Exception as e:
+            logger.warning(f"Could not read {CONFIG_FILE.name} ({key}): {e}")
+        return default
+
+    def _save_config(self) -> None:
+        """Persist all runtime-adjustable settings to bot_config.json."""
+        import json
+        try:
+            data = {}
+            if CONFIG_FILE.exists():
+                try:
+                    data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            data["order_amount_usd"] = self.order_amount_usd
+            data["balance_report_interval"] = self.balance_report_interval
+            CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            logger.info(f"Config saved to {CONFIG_FILE.name}")
+        except Exception as e:
+            logger.warning(f"Could not save {CONFIG_FILE.name}: {e}")
+
+    # kept for backwards compatibility
+    def _load_order_amount(self) -> float:
+        return self._load_config_value("order_amount_usd", float(os.environ.get("ORDER_AMOUNT_USD", "5")))
+
+    def _save_order_amount(self) -> None:
+        self._save_config()
+
+    # ------------------------------------------------------------------
     # Telegram helpers
     # ------------------------------------------------------------------
 
@@ -137,10 +254,116 @@ class Btc5MinStrategy(BaseStrategy):
         """Fetch balance and send it to Telegram."""
         balance = await self.bot.get_balance()
         prefix = f"[{context}] " if context else ""
-        msg = f"💰 {prefix}Current balance: <b>${balance:.2f} USDC</b>"
+        dry = " [DRY RUN]" if self.dry_run else ""
+        msg = f"\U0001f4b0 {prefix}Current balance: <b>${balance:.2f} USDC</b>{dry}"
         logger.info(msg)
         await self._notify(msg)
         self._last_balance_report = time.time()
+
+    # ------------------------------------------------------------------
+    # Telegram command handler (runs concurrently with strategy loop)
+    # ------------------------------------------------------------------
+
+    async def _handle_telegram_commands(self) -> None:
+        """Poll Telegram for commands and respond to them."""
+        if not self.telegram:
+            return
+
+        dry_tag = " <i>[DRY RUN]</i>" if self.dry_run else ""
+        HELP = (
+            "\U0001f916 <b>Available commands:</b>\n"
+            "/balance \u2014 current USDC balance\n"
+            "/size \u2014 current order size (USD per side)\n"
+            "/setsize &lt;amount&gt; \u2014 set order size (e.g. /setsize 10)\n"
+            "/interval \u2014 current balance report interval\n"
+            "/setinterval &lt;minutes&gt; \u2014 set report interval (e.g. /setinterval 30)"
+        )
+
+        while self.status == StrategyStatus.RUNNING:
+            try:
+                updates = await self.telegram.get_updates()
+                for update in updates:
+                    msg = update.get("message") or update.get("edited_message")
+                    if not msg:
+                        continue
+
+                    text = (msg.get("text") or "").strip()
+                    chat_id = str(msg["chat"]["id"])
+
+                    if not text.startswith("/"):
+                        continue
+
+                    # Strip bot username suffix (e.g. /balance@MyBot -> /balance)
+                    command = text.split()[0].lower().split("@")[0]
+                    args = text.split()[1:]
+
+                    if command == "/balance":
+                        balance = await self.bot.get_balance()
+                        reply = f"\U0001f4b0 Current balance: <b>${balance:.2f} USDC</b>{dry_tag}"
+
+                    elif command == "/size":
+                        reply = (
+                            f"\U0001f4d0 Current order size: <b>${self.order_amount_usd:.2f} USD</b> per side\n"
+                            f"(Total per cycle: <b>${self.order_amount_usd * 2:.2f} USD</b>){dry_tag}"
+                        )
+
+                    elif command == "/setsize":
+                        if not args:
+                            reply = "\u274c Usage: /setsize &lt;amount&gt;  (e.g. /setsize 10)"
+                        else:
+                            try:
+                                new_size = float(args[0])
+                                if new_size <= 0:
+                                    raise ValueError("must be positive")
+                                old_size = self.order_amount_usd
+                                self.order_amount_usd = new_size
+                                self._save_config()
+                                logger.info(f"Order size changed via Telegram: ${old_size} -> ${new_size}")
+                                reply = (
+                                    f"\u2705 Order size updated: "
+                                    f"<b>${old_size:.2f}</b> \u2192 <b>${new_size:.2f} USD</b> per side{dry_tag}"
+                                )
+                            except ValueError as e:
+                                reply = f"\u274c Invalid amount: {e}"
+
+                    elif command == "/interval":
+                        mins = self.balance_report_interval / 60
+                        reply = (
+                            f"\u23f0 Balance report interval: "
+                            f"<b>{mins:.0f} min</b> ({self.balance_report_interval:.0f}s){dry_tag}"
+                        )
+
+                    elif command == "/setinterval":
+                        if not args:
+                            reply = "\u274c Usage: /setinterval &lt;minutes&gt;  (e.g. /setinterval 30)"
+                        else:
+                            try:
+                                new_mins = float(args[0])
+                                if new_mins <= 0:
+                                    raise ValueError("must be positive")
+                                old_mins = self.balance_report_interval / 60
+                                self.balance_report_interval = new_mins * 60
+                                self._save_config()
+                                logger.info(f"Balance report interval changed via Telegram: {old_mins:.0f}min -> {new_mins:.0f}min")
+                                reply = (
+                                    f"\u2705 Report interval updated: "
+                                    f"<b>{old_mins:.0f} min</b> \u2192 <b>{new_mins:.0f} min</b>{dry_tag}"
+                                )
+                            except ValueError as e:
+                                reply = f"\u274c Invalid value: {e}"
+
+                    elif command in ("/help", "/start"):
+                        reply = HELP
+
+                    else:
+                        reply = HELP
+
+                    await self.telegram.send(reply, chat_id=chat_id)
+
+            except Exception as e:
+                logger.debug(f"Command handler error: {e}")
+
+            await asyncio.sleep(2)  # poll every 2 seconds
 
     # ------------------------------------------------------------------
     # Lifecycle overrides
@@ -148,10 +371,12 @@ class Btc5MinStrategy(BaseStrategy):
 
     async def initialize(self) -> None:
         await super().initialize()
-        await self._report_balance("Bot started")
+        dry = " [DRY RUN]" if self.dry_run else ""
+        await self._report_balance(f"Bot started{dry}")
 
     async def cleanup(self) -> None:
-        await self._report_balance("Bot stopped")
+        dry = " [DRY RUN]" if self.dry_run else ""
+        await self._report_balance(f"Bot stopped{dry}")
         await super().cleanup()
 
     # ------------------------------------------------------------------
@@ -161,29 +386,37 @@ class Btc5MinStrategy(BaseStrategy):
     async def run(self, token_ids: List[str] = None, duration: int = None):
         """
         Override run loop to support dynamic market discovery.
-        We don't need fixed token_ids.
+        Runs strategy loop and Telegram command poller concurrently.
         """
         await self.initialize()
-        start_time = time.time()
 
-        try:
-            while self.status == StrategyStatus.RUNNING:
-                if duration and (time.time() - start_time) > duration:
-                    break
+        async def _strategy_loop():
+            start_time = time.time()
+            try:
+                while self.status == StrategyStatus.RUNNING:
+                    if duration and (time.time() - start_time) > duration:
+                        break
 
-                # Sync order statuses first (triggers on_order_update on changes)
-                await self.sync_orders()
+                    # Sync order statuses first (triggers on_order_update on changes)
+                    await self.sync_orders()
 
-                # Main Strategy Logic
-                await self.on_tick({})
+                    # Main Strategy Logic
+                    await self.on_tick({})
 
-                # Hourly balance report
-                if time.time() - self._last_balance_report >= 3600:
-                    await self._report_balance("Hourly update")
+                    # Periodic balance report
+                    if time.time() - self._last_balance_report >= self.balance_report_interval:
+                        interval_mins = self.balance_report_interval / 60
+                        await self._report_balance(f"Update (every {interval_mins:.0f}min)")
 
-                await asyncio.sleep(self.check_interval)
-        finally:
-            await self.cleanup()
+                    await asyncio.sleep(self.check_interval)
+            finally:
+                await self.cleanup()
+
+        # Run strategy loop and Telegram command poller concurrently
+        await asyncio.gather(
+            _strategy_loop(),
+            self._handle_telegram_commands(),
+        )
 
     # ------------------------------------------------------------------
     # Tick logic
@@ -235,7 +468,7 @@ class Btc5MinStrategy(BaseStrategy):
             if end_date_iso.endswith("Z"):
                 end_date_iso = end_date_iso[:-1] + "+00:00"
             cycle_end = datetime.fromisoformat(end_date_iso).timestamp()
-        except:
+        except Exception:
             cycle_end = time.time() + (MARKET_DURATION * 60)
 
         # Skip if we've already entered this cycle
@@ -253,36 +486,42 @@ class Btc5MinStrategy(BaseStrategy):
             # Parse Tokens
             token_ids = self.gamma.parse_token_ids(market)
 
-            # Read order amount from env (fallback to 5)
-            order_amount_usd = float(os.environ.get("ORDER_AMOUNT_USD", "5"))
+            # Read order amount from instance variable (runtime-adjustable via /setsize)
+            order_amount_usd = self.order_amount_usd
             size = round(order_amount_usd / ORDER_PRICE, 0)
 
             # Recalculate actual cost after rounding (size * price, two sides)
             actual_cost_per_side = round(size * ORDER_PRICE, 2)
             total_cost = actual_cost_per_side * 2
 
-            # Pre-flight balance check
-            balance = await self.bot.get_balance()
-            if balance < total_cost:
-                warn_msg = (
-                    f"Insufficient balance: ${balance:.2f} available, "
-                    f"${total_cost:.2f} required ({actual_cost_per_side:.2f} × 2 sides). "
-                    f"Skipping cycle."
-                )
-                logger.warning(warn_msg)
-                # Send Telegram alert once per cycle (key = cycle_end)
-                if cycle_end not in self._low_balance_notified:
-                    self._low_balance_notified.add(cycle_end)
-                    await self._notify(f"⚠️ {warn_msg}")
-                # Un-mark so we retry on the next tick
-                self.entered_cycles.discard(cycle_end)
-                return
+            # Pre-flight balance check (skip in dry-run — no real funds needed)
+            if not self.dry_run:
+                balance = await self.bot.get_balance()
+                if balance < total_cost:
+                    warn_msg = (
+                        f"Insufficient balance: ${balance:.2f} available, "
+                        f"${total_cost:.2f} required ({actual_cost_per_side:.2f} x 2 sides). "
+                        f"Skipping cycle."
+                    )
+                    logger.warning(warn_msg)
+                    # Send Telegram alert once per cycle
+                    if cycle_end not in self._low_balance_notified:
+                        self._low_balance_notified.add(cycle_end)
+                        await self._notify(f"\u26a0\ufe0f {warn_msg}")
+                    # Un-mark so we retry on the next tick
+                    self.entered_cycles.discard(cycle_end)
+                    return
 
-            logger.info(
-                f"Balance OK: ${balance:.2f} available, "
-                f"${total_cost:.2f} required. "
-                f"Placing orders: Size={size} @ {ORDER_PRICE} (${actual_cost_per_side:.2f} each side)"
-            )
+                logger.info(
+                    f"Balance OK: ${balance:.2f} available, "
+                    f"${total_cost:.2f} required. "
+                    f"Placing orders: Size={size} @ {ORDER_PRICE} (${actual_cost_per_side:.2f} each side)"
+                )
+            else:
+                logger.info(
+                    f"[DRY RUN] Simulating orders: Size={size} @ {ORDER_PRICE} "
+                    f"(${actual_cost_per_side:.2f} each side, ${total_cost:.2f} total)"
+                )
 
             # Buy UP
             await self.place_order(
@@ -325,14 +564,19 @@ class Btc5MinStrategy(BaseStrategy):
 
                 logger.info(f"Fetching actual token balance for {order.token_id}...")
 
-                # Retry balance fetch — there's a propagation delay between fill and balance update
-                actual_balance = 0.0
-                for attempt in range(6):
-                    actual_balance = await self.bot.get_token_balance(order.token_id)
-                    if actual_balance > 0:
-                        break
-                    logger.info(f"Balance not yet updated (attempt {attempt + 1}/6), retrying in 2s...")
-                    await asyncio.sleep(2)
+                if self.dry_run:
+                    # Simulate a balance equal to what we bought
+                    actual_balance = order.size
+                    logger.info(f"[DRY RUN] Simulated token balance: {actual_balance}")
+                else:
+                    # Retry balance fetch — there's a propagation delay between fill and balance update
+                    actual_balance = 0.0
+                    for attempt in range(6):
+                        actual_balance = await self.bot.get_token_balance(order.token_id)
+                        if actual_balance > 0:
+                            break
+                        logger.info(f"Balance not yet updated (attempt {attempt + 1}/6), retrying in 2s...")
+                        await asyncio.sleep(2)
 
                 if actual_balance <= 0:
                     logger.warning(f"Token balance still 0 after retries for {order.token_id}, skipping sell.")
@@ -364,8 +608,6 @@ class Btc5MinStrategy(BaseStrategy):
                 self.close_position(order.token_id, 'BUY')
 
 
-
-
 async def main():
     load_dotenv()
     private_key = os.environ.get("POLY_PRIVATE_KEY")
@@ -375,16 +617,16 @@ async def main():
 
     config = Config.from_env()
     bot = TradingBot(config=config, private_key=private_key)
-    
+
     if not bot.config.use_gasless:
-         logger.warning("Gasless mode not enabled")
+        logger.warning("Gasless mode not enabled")
 
     # Initialize strategy
     # check_interval: 1 second for fast monitoring of cycle end
     strategy = Btc5MinStrategy(bot, params={"check_interval": 1})
-    
+
     logger.info("Starting BTC 5Min Strategy (Refactored)...")
-    
+
     # We pass an empty list of tokens because we dynamically find markets.
     # The run loop will call on_tick periodically.
     await strategy.run(token_ids=[], duration=None)

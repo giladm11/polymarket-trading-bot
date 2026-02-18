@@ -38,6 +38,7 @@ htmlcov/
 # Project secrets and generated config
 config.yaml
 credentials/
+strategy/bot_config.json
 
 # Logs and local data
 *.log
