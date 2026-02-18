@@ -168,6 +168,7 @@ class OrderData:
     signature_type: int = 2
     neg_risk: bool = False
     tick_size: str = "0.01"
+    expiration: int = 0  # Unix timestamp; 0 = GTC (never expires)
 
     def __post_init__(self):
         """Validate and normalize order parameters."""
@@ -344,7 +345,7 @@ class OrderSigner:
                 tokenId=int(order.token_id),
                 makerAmount=order.maker_amount,
                 takerAmount=order.taker_amount,
-                expiration=0,
+                expiration=order.expiration,
                 nonce=order.nonce,
                 feeRateBps=order.fee_rate_bps,
                 side=order.side_value,
@@ -370,7 +371,7 @@ class OrderSigner:
                     "tokenId": str(order.token_id),
                     "makerAmount": str(order.maker_amount),
                     "takerAmount": str(order.taker_amount),
-                    "expiration": "0",
+                    "expiration": str(order.expiration),
                     "nonce": str(order.nonce),
                     "feeRateBps": str(order.fee_rate_bps),
                     "side": order.side,  # "BUY" or "SELL"

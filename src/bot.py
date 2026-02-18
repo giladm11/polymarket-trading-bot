@@ -296,7 +296,8 @@ class TradingBot:
         size: float,
         side: str,
         order_type: str = "GTC",
-        fee_rate_bps: int = -1
+        fee_rate_bps: int = -1,
+        expiration: int = 0,
     ) -> OrderResult:
         """
         Place a limit order.
@@ -339,6 +340,7 @@ class TradingBot:
                 signature_type=self.config.clob.signature_type,
                 neg_risk=neg_risk,
                 tick_size=tick_size,
+                expiration=expiration,
             )
 
             # Sign order
