@@ -81,7 +81,7 @@ class OrderResult:
 
         return cls(
             success=success,
-            order_id=response.get("orderId"),
+            order_id=response.get("orderID"),
             status=response.get("status"),
             message=error_msg if not success else "Order placed successfully",
             data=response

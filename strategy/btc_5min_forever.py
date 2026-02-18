@@ -66,6 +66,8 @@ class Btc5MinStrategy(BaseStrategy):
         
         try:
             while self.status == StrategyStatus.RUNNING:
+                await self.sync_orders()
+
                 if duration and (time.time() - start_time) > duration:
                     break
                 

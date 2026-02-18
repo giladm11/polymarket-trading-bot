@@ -123,7 +123,7 @@ class BaseStrategy(ABC):
         self.on_error_callbacks: List[Callable[[Exception], None]] = []
 
         # Settings
-        self.check_interval = self.params.get('check_interval', 60)  # seconds
+        self.check_interval = self.params.get('check_interval', 1)  # seconds
         self.max_positions = self.params.get('max_positions', 3)
         self.stop_loss = self.params.get('stop_loss')  # e.g., 0.1 = 10%
         self.take_profit = self.params.get('take_profit')  # e.g., 0.2 = 20%
@@ -237,14 +237,13 @@ class BaseStrategy(ABC):
     async def sync_orders(self) -> None:
         """Sync order status with exchange."""
         for order_id, order in list(self.orders.items()):
-            if order.status != 'pending':
-                continue
-
             order_data = await self.bot.get_order(order_id)
             if order_data:
                 new_status = order_data.get('status', order.status)
-                order.status = new_status
-                await self.on_order_update(order)
+
+                if order.status != new_status:
+                    order.status = new_status
+                    await self.on_order_update(order)
 
     def add_position(self, position: Position) -> None:
         """Add a position."""
