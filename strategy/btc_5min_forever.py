@@ -29,7 +29,7 @@ from src.config import Config
 from examples.strategy_example import BaseStrategy, Position, OrderInfo, StrategyStatus
 
 # Configuration
-ORDER_AMOUNT_USD = 5
+ORDER_AMOUNT_USD = 75
 ORDER_PRICE = 0.45
 SELL_PRICE = 0.99
 MARKET_DURATION = 5  # minutes
