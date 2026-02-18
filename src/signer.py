@@ -122,19 +122,19 @@ def get_order_amounts(side: str, size: float, price: float, tick_size: str = "0.
     if side == "BUY":
         raw_taker_amt = _round_down(size, rc["size"])
         raw_maker_amt = raw_taker_amt * raw_price
+        # Round DOWN: makerAmount is USDC we spend — never claim more than we have
         if _decimal_places(raw_maker_amt) > rc["amount"]:
-            raw_maker_amt = _round_up(raw_maker_amt, rc["amount"] + 4)
-            if _decimal_places(raw_maker_amt) > rc["amount"]:
-                raw_maker_amt = _round_down(raw_maker_amt, rc["amount"])
+            raw_maker_amt = _round_down(raw_maker_amt, rc["amount"])
         return 0, _to_token_decimals(raw_maker_amt), _to_token_decimals(raw_taker_amt)
 
     elif side == "SELL":
         raw_maker_amt = _round_down(size, rc["size"])
         raw_taker_amt = raw_maker_amt * raw_price
-
-        # FIX: must round DOWN, not UP
+        # takerAmount is USDC received — round up then fallback down
         if _decimal_places(raw_taker_amt) > rc["amount"]:
-            raw_taker_amt = _round_down(raw_taker_amt, rc["amount"])
+            raw_taker_amt = _round_up(raw_taker_amt, rc["amount"] + 4)
+            if _decimal_places(raw_taker_amt) > rc["amount"]:
+                raw_taker_amt = _round_down(raw_taker_amt, rc["amount"])
         return 1, _to_token_decimals(raw_maker_amt), _to_token_decimals(raw_taker_amt)
 
     else:

@@ -552,6 +552,41 @@ class ClobClient(ApiClient):
             print(f"  [DEBUG] balance error: {e}")
             return 0.0
 
+    def get_token_balance(self, token_id: str) -> float:
+        """
+        Get the share balance for a specific conditional token (outcome token).
+
+        Args:
+            token_id: The ERC-1155 token ID to check balance for
+
+        Returns:
+            Share balance as float (already divided by 1e6)
+        """
+        endpoint = "/balance-allowance"
+        headers = self._build_headers("GET", endpoint)
+        try:
+            result = self._request(
+                "GET",
+                endpoint,
+                headers=headers,
+                params={
+                    "asset_type": "CONDITIONAL",
+                    "token_id": token_id,
+                    "signature_type": self.signature_type,
+                },
+            )
+            if isinstance(result, dict):
+                raw = result.get("balance", 0)
+                balance = float(raw)
+                if balance > 10_000:
+                    balance = balance / 1e6
+                return balance
+            return 0.0
+        except Exception as e:
+            print(f"  [DEBUG] token balance error: {e}")
+            return 0.0
+
+
     def post_order(
         self,
         signed_order: Dict[str, Any],

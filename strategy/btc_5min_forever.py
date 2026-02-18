@@ -14,7 +14,7 @@ import asyncio
 import logging
 import time
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
@@ -54,7 +54,16 @@ class Btc5MinStrategy(BaseStrategy):
         self.token_ids: Dict[str, str] = {}
         self.cycle_end_time = 0.0
         self.cycle_active = False
-        self.last_slug = None
+
+        # Track which cycle end times we've already placed orders for (by end timestamp)
+        # On startup, pre-populate with the current window so we skip it.
+        now = datetime.now(timezone.utc)
+        current_minute = (now.minute // MARKET_DURATION) * MARKET_DURATION
+        current_window_start = now.replace(minute=current_minute, second=0, microsecond=0)
+        current_window_end = current_window_start.timestamp() + (MARKET_DURATION * 60)
+        self.entered_cycles = {current_window_end}  # set of end timestamps already traded
+        self._entering = False  # guard against concurrent order placement
+        logger.info(f"Bot started. Skipping current cycle, will enter next one after {datetime.fromtimestamp(current_window_end)}")
 
     async def run(self, token_ids: List[str] = None, duration: int = None):
         """
@@ -66,18 +75,14 @@ class Btc5MinStrategy(BaseStrategy):
         
         try:
             while self.status == StrategyStatus.RUNNING:
-                await self.sync_orders()
-
                 if duration and (time.time() - start_time) > duration:
                     break
                 
+                # Sync order statuses first (triggers on_order_update on changes)
+                await self.sync_orders()
+
                 # Main Strategy Logic
                 await self.on_tick({})
-                
-                # Poll orders manually since we might not rely on socket updates yet
-                # (BaseStrategy usually needs a socket listener or manual polling)
-                # We will manually sync orders here
-                await self.sync_orders()
 
                 await asyncio.sleep(self.check_interval)
         finally:
@@ -85,111 +90,142 @@ class Btc5MinStrategy(BaseStrategy):
 
     async def on_tick(self, _: Dict[str, Any]) -> None:
         """
-        Called periodically.
-        Manages the market cycle state.
+        Called every second.
+        - If cycle ended, clean up state.
+        - Always try to pre-place orders for the next upcoming market.
         """
         now = time.time()
         
-        # 1. If no active cycle, find next market
-        if not self.cycle_active:
-            await self.find_and_enter_market()
-        
-        # 2. If cycle is active, check if it's over
-        elif self.cycle_active and now >= self.cycle_end_time:
+        # 1. Check if current cycle has ended
+        if self.cycle_active and now >= self.cycle_end_time:
             logger.info("Cycle ended.")
-            # await self.cancel_all_orders() # Disabled as per user request
             self.cycle_active = False
             self.current_market = None
             self.token_ids = {}
-            # Wait a small buffer before searching again
-            await asyncio.sleep(5) 
+            # Clean up unfilled orders from tracking (don't cancel on-chain)
+            for order_id in list(self.orders.keys()):
+                if self.orders[order_id].status not in ('filled', 'MATCHED', 'cancelled'):
+                    logger.info(f"Dropping unfulfilled order {order_id} from tracking.")
+                    del self.orders[order_id]
 
-    async def find_and_enter_market(self):
-        """Find next market and place initial orders."""
-        logger.info("Looking for next BTC 5min market...")
+        # 2. Always try to place orders for the next upcoming market
+        await self.try_enter_next_market()
+
+    async def try_enter_next_market(self):
+        """
+        Look for the next upcoming market and place orders if we haven't yet.
+        This runs every tick so we pre-place orders before the cycle starts.
+        """
+        # Guard: prevent re-entry while orders are being placed
+        if self._entering:
+            return
+
         market = self.gamma.get_next_market("BTC")
-        
+
         if not market:
-            logger.info("No market found. Retrying next tick...")
             return
 
-        slug = market.get("slug")
-        if slug == self.last_slug:
-            # Already played this one
+        if not market.get("acceptingOrders", False):
             return
-            
-        logger.info(f"Found market: {slug}")
-        self.last_slug = slug
-        self.current_market = market
-        
-        # Calculate End Time
-        end_date_iso = market.get("endDate")
+
+        # Calculate end time to use as unique cycle key
+        end_date_iso = market.get("endDate", "")
         try:
             if end_date_iso.endswith("Z"):
                 end_date_iso = end_date_iso[:-1] + "+00:00"
-            self.cycle_end_time = datetime.fromisoformat(end_date_iso).timestamp()
+            cycle_end = datetime.fromisoformat(end_date_iso).timestamp()
         except:
-            self.cycle_end_time = time.time() + (MARKET_DURATION * 60)
+            cycle_end = time.time() + (MARKET_DURATION * 60)
 
-        # Parse Tokens
-        self.token_ids = self.gamma.parse_token_ids(market)
-        
-        # Calculate Size
-        size = round(ORDER_AMOUNT_USD / ORDER_PRICE, 0)
-        
-        # Place Orders
-        logger.info(f"Placing initial orders. Size={size} @ {ORDER_PRICE}")
-        
-        # Buy UP
-        await self.place_order(
-            token_id=self.token_ids["up"],
-            price=ORDER_PRICE,
-            size=size,
-            side="BUY"
-        )
-        # Buy DOWN
-        await self.place_order(
-            token_id=self.token_ids["down"],
-            price=ORDER_PRICE,
-            size=size,
-            side="BUY"
-        )
-        
-        self.cycle_active = True
-        logger.info(f"Cycle started. Ends at {datetime.fromtimestamp(self.cycle_end_time)}")
+        # Skip if we've already entered this cycle
+        if cycle_end in self.entered_cycles:
+            return
+
+        # Mark as entered immediately — before any awaits — to block concurrent ticks
+        self.entered_cycles.add(cycle_end)
+        self._entering = True
+
+        try:
+            slug = market.get("slug")
+            logger.info(f"Pre-placing orders for next market: {slug} (ends {datetime.fromtimestamp(cycle_end)})")
+
+            # Parse Tokens
+            token_ids = self.gamma.parse_token_ids(market)
+            size = round(ORDER_AMOUNT_USD / ORDER_PRICE, 0)
+            logger.info(f"Placing orders: Size={size} @ {ORDER_PRICE}")
+
+            # Buy UP
+            await self.place_order(
+                token_id=token_ids["up"],
+                price=ORDER_PRICE,
+                size=size,
+                side="BUY"
+            )
+            # Buy DOWN
+            await self.place_order(
+                token_id=token_ids["down"],
+                price=ORDER_PRICE,
+                size=size,
+                side="BUY"
+            )
+
+            # Update cycle tracking
+            self.cycle_end_time = cycle_end
+            self.cycle_active = True
+            self.current_market = market
+            self.token_ids = token_ids
+            logger.info(f"Orders placed. Cycle ends at {datetime.fromtimestamp(cycle_end)}")
+        finally:
+            self._entering = False
 
     async def on_order_update(self, order: OrderInfo) -> None:
         """
         Handle order updates.
-        If a BUY order fills, place a SELL order.
+        If a BUY order fills, place a SELL order using the actual token balance.
         """
-        if order.status == 'filled' or order.status == 'MATCHED':  # 'MATCHED' is API status
+        if order.status in ('filled', 'MATCHED'):
             if order.side == 'BUY':
-                logger.info(f"Order {order.order_id} ({order.side}) filled! Placing SELL at {SELL_PRICE}")
-                
-                # Check if we already have a sell for this Token ID to avoid duplicates?
-                # For simplicity, we just place the sell order.
-                # BaseStrategy doesn't track "pending sell for this position" specifically,
-                # but we can check open orders if needed. 
-                
+                logger.info(f"Order {order.order_id} (BUY) filled! Fetching actual token balance...")
+
+                # Retry balance fetch — there's a propagation delay between fill and balance update
+                actual_balance = 0.0
+                for attempt in range(6):
+                    actual_balance = await self.bot.get_token_balance(order.token_id)
+                    if actual_balance > 0:
+                        break
+                    logger.info(f"Balance not yet updated (attempt {attempt + 1}/6), retrying in 2s...")
+                    await asyncio.sleep(2)
+
+                if actual_balance <= 0:
+                    logger.warning(f"Token balance still 0 after retries for {order.token_id}, skipping sell.")
+                    return
+
+                # Round down to 2dp to stay within balance
+                sell_size = round(actual_balance, 2)
+                if sell_size > actual_balance:
+                    sell_size = sell_size - 0.01
+
+                logger.info(f"Placing SELL {sell_size} @ {SELL_PRICE} (balance: {actual_balance})")
+
                 await self.place_order(
                     token_id=order.token_id,
                     price=SELL_PRICE,
-                    size=order.size,
+                    size=sell_size,
                     side="SELL"
                 )
-                
-                # Add position tracking (optional, but good practice)
+
                 self.add_position(Position(
                     token_id=order.token_id,
                     side='BUY',
-                    size=order.size,
+                    size=sell_size,
                     entry_price=order.price
                 ))
 
             elif order.side == 'SELL':
                 logger.info(f"Sell order {order.order_id} filled. Profit secured.")
                 self.close_position(order.token_id, 'BUY')
+
+
 
 
 async def main():

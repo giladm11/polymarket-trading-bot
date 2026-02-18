@@ -492,6 +492,25 @@ class TradingBot:
             logger.error(f"Failed to get balance: {e}")
             return 0.0
 
+    async def get_token_balance(self, token_id: str) -> float:
+        """
+        Get the share balance for a specific conditional token.
+
+        Args:
+            token_id: The ERC-1155 token ID
+
+        Returns:
+            Share balance as float
+        """
+        try:
+            balance = await self._run_in_thread(self.clob_client.get_token_balance, token_id)
+            logger.debug(f"Token balance ({token_id[:16]}...): {balance}")
+            return balance
+        except Exception as e:
+            logger.error(f"Failed to get token balance: {e}")
+            return 0.0
+
+
     async def get_open_orders(self) -> List[Dict[str, Any]]:
         """
         Get all open orders.
