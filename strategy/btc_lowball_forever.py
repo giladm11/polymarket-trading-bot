@@ -52,12 +52,15 @@ from examples.strategy_example import BaseStrategy, Position, OrderInfo, Strateg
 # ---------------------------------------------------------------------------
 
 # Buy prices for the 4 grid levels and their corresponding sell multiplier
-BUY_PRICES = [0.15, 0.10, 0.05, 0.02]
-SELL_MULTIPLIER = 4.0          # sell price = buy price × SELL_MULTIPLIER
+BUY_PRICES = [0.40, 0.10, 0.05, 0.02]
+SELL_MULTIPLIER = 2          # sell price = buy price × SELL_MULTIPLIER
 
 MARKET_DURATION = 5            # minutes per cycle
-# Orders are cancelled this many seconds before cycle end if still open
-ORDER_CANCEL_BEFORE_END = 210  # 3.5 × 60 = 210 seconds
+# Orders are cancelled this many seconds before cycle end if still open.
+# NOTE: Gamma's endDate is systematically ~60s ahead of the real market close,
+# so we subtract 60s from the intended 3.5 min (210s) window to compensate:
+#   150s here  +  60s API offset  =  210s = 3.5 min before actual cycle end.
+ORDER_CANCEL_BEFORE_END = 180  # 210s - 60s offset compensation
 
 SELL_DELAY_SECONDS = 5         # wait after fill before placing sell
 
@@ -277,7 +280,7 @@ class BtcLowballStrategy(BaseStrategy):
             self.orders[fake.order_id] = fake
             await asyncio.sleep(0.05)   # small delay to avoid identical timestamps
             return fake
-        return await self.bot.place_order(
+        result = await self.bot.place_order(
             token_id=token_id,
             price=price,
             size=size,
@@ -285,6 +288,22 @@ class BtcLowballStrategy(BaseStrategy):
             order_type=order_type,
             expiration=expiration,
         )
+        if not result or not result.success or not result.order_id:
+            logger.warning(
+                f"Order placement failed or returned no ID: {result.message if result else 'no result'}"
+            )
+            return None
+
+        order_info = OrderInfo(
+            order_id=result.order_id,
+            token_id=token_id,
+            side=side,
+            price=price,
+            size=size,
+            status="pending",
+        )
+        self.orders[order_info.order_id] = order_info
+        return order_info
 
     # ------------------------------------------------------------------
     # Telegram helpers
