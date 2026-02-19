@@ -52,7 +52,7 @@ from examples.strategy_example import BaseStrategy, Position, OrderInfo, Strateg
 # ---------------------------------------------------------------------------
 
 # Buy prices for the 4 grid levels and their corresponding sell multiplier
-BUY_PRICES = [0.40, 0.10, 0.05, 0.02]
+BUY_PRICES = [0.15, 0.10, 0.05, 0.02]
 SELL_MULTIPLIER = 2          # sell price = buy price × SELL_MULTIPLIER
 
 MARKET_DURATION = 5            # minutes per cycle
@@ -676,14 +676,7 @@ class BtcLowballStrategy(BaseStrategy):
                 f"(3.5 min before cycle end {datetime.fromtimestamp(cycle_end)})."
             )
 
-            await self._notify(
-                f"\U0001f7e2 <b>Lowball grid active</b>\n"
-                f"Market: {slug}\n"
-                f"Ends: {datetime.fromtimestamp(cycle_end).strftime('%H:%M:%S')}\n"
-                f"Levels: " + ", ".join(str(p) for p in BUY_PRICES) + "\n"
-                f"Size per level: ${order_amount_usd:.2f} USD\n"
-                f"Orders cancel at: {cancel_at.strftime('%H:%M:%S')}"
-            )
+
 
         finally:
             self._entering = False
