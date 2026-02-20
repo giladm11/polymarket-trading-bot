@@ -289,9 +289,12 @@ class BtcLowballStrategy(BaseStrategy):
             expiration=expiration,
         )
         if not result or not result.success or not result.order_id:
-            logger.warning(
-                f"Order placement failed or returned no ID: {result.message if result else 'no result'}"
-            )
+            import html
+            error_msg = result.message if result else 'no result'
+            log_msg = f"Order placement failed: {error_msg} (side: {side}, size: {size}, price: {price})"
+            logger.warning(log_msg)
+            safe_error_msg = html.escape(str(error_msg))
+            await self._notify(f"\u274c <b>ORDER FAILED:</b> {safe_error_msg}\nSide: {side}\nSize: {size}\nPrice: {price}")
             return None
 
         order_info = OrderInfo(
@@ -735,6 +738,7 @@ class BtcLowballStrategy(BaseStrategy):
             logger.info(f"Sell order placed: {sell_order.order_id}")
         else:
             logger.warning(f"Failed to place sell order for token {order.token_id} (even after size retry)")
+            await self._notify(f"\u26a0\ufe0f <b>SELL FAILED:</b> Could not place auto-sell for {order.token_id[:16]}... even after retrying.")
 
         # Track the position
         self.add_position(Position(
