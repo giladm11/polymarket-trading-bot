@@ -52,7 +52,7 @@ from examples.strategy_example import BaseStrategy, Position, OrderInfo, Strateg
 # ---------------------------------------------------------------------------
 
 # Buy prices for the 4 grid levels and their corresponding sell multiplier
-BUY_PRICES = [0.49, 0.48, 0.07, 0.05]
+BUY_PRICES = [0.10, 0.08, 0.07, 0.05]
 SELL_MULTIPLIER = 2          # sell price = buy price × SELL_MULTIPLIER
 
 MARKET_DURATION = 5            # minutes per cycle
