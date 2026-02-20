@@ -62,6 +62,7 @@ class OrderInfo:
     side: str
     price: float
     size: float
+    size_matched: float = 0.0
     status: str  # 'pending', 'filled', 'cancelled'
     placed_at: datetime = field(default_factory=datetime.now)
 
@@ -240,9 +241,13 @@ class BaseStrategy(ABC):
             order_data = await self.bot.get_order(order_id)
             if order_data:
                 new_status = order_data.get('status', order.status)
+                new_size_matched = float(order_data.get('size_matched', order.size_matched))
 
                 if order.status != new_status:
                     order.status = new_status
+                    order.size_matched = new_size_matched
+
+
                     await self.on_order_update(order)
 
     def add_position(self, position: Position) -> None:
