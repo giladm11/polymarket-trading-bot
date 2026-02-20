@@ -39,6 +39,7 @@ htmlcov/
 config.yaml
 credentials/
 strategy/bot_config.json
+strategy/bot_config_lowball.json
 
 # Logs and local data
 *.log

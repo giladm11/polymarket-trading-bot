@@ -52,7 +52,7 @@ from examples.strategy_example import BaseStrategy, Position, OrderInfo, Strateg
 # ---------------------------------------------------------------------------
 
 # Buy prices for the 4 grid levels and their corresponding sell multiplier
-BUY_PRICES = [0.10, 0.08, 0.05, 0.02]
+BUY_PRICES = [0.49, 0.48, 0.07, 0.05]
 SELL_MULTIPLIER = 2          # sell price = buy price × SELL_MULTIPLIER
 
 MARKET_DURATION = 5            # minutes per cycle
@@ -65,7 +65,7 @@ ORDER_CANCEL_BEFORE_END = 180  # 210s - 60s offset compensation
 SELL_DELAY_SECONDS = 5         # wait after fill before placing sell
 
 # Persistent config file
-CONFIG_FILE = Path(__file__).parent / "bot_config.json"
+CONFIG_FILE = Path(__file__).parent / "bot_config_lowball.json"
 
 # Configure logging
 logging.basicConfig(
@@ -220,7 +220,7 @@ class BtcLowballStrategy(BaseStrategy):
     # ------------------------------------------------------------------
 
     def _load_config_value(self, key: str, default):
-        """Load a single value from bot_config.json, falling back to default."""
+        """Load a single value from bot_config_lowball.json, falling back to default."""
         import json
         try:
             if CONFIG_FILE.exists():
@@ -234,7 +234,7 @@ class BtcLowballStrategy(BaseStrategy):
         return default
 
     def _save_config(self) -> None:
-        """Persist all runtime-adjustable settings to bot_config.json."""
+        """Persist all runtime-adjustable settings to bot_config_lowball.json."""
         import json
         try:
             data = {}
@@ -685,6 +685,55 @@ class BtcLowballStrategy(BaseStrategy):
     # Order updates
     # ------------------------------------------------------------------
 
+    async def _handle_buy_fill(self, order: OrderInfo, buy_price: float, sell_price: float) -> None:
+        """
+        Handle post-fill logic for BUY orders in the background:
+        - Notify Telegram
+        - Wait 5 seconds
+        - Place matching SELL order
+        - Update position tracking
+        """
+        # Notify Telegram immediately on fill
+        await self._notify(
+            f"\U0001f7e1 <b>BUY FILLED</b>\n"
+            f"Token: {order.token_id[:20]}...\n"
+            f"Buy price: <b>{buy_price}</b>\n"
+            f"Sell target: <b>{sell_price}</b> (×{SELL_MULTIPLIER:.0f})\n"
+            f"Size: {order.size:.2f} shares"
+        )
+
+        # Wait before placing sell order (non-blocking sleep)
+        await asyncio.sleep(SELL_DELAY_SECONDS)
+
+        # Use the filled quantity directly
+        sell_size = order.size
+
+        logger.info(
+            f"Placing SELL {sell_size:.2f} shares @ {sell_price} "
+            f"(filled size: {sell_size:.4f})"
+        )
+
+        sell_order = await self.place_order(
+            token_id=order.token_id,
+            price=sell_price,
+            size=sell_size,
+            side="SELL",
+        )
+
+        if sell_order:
+            logger.info(f"Sell order placed: {sell_order.order_id}")
+        else:
+            logger.warning(f"Failed to place sell order for token {order.token_id}")
+
+        # Track the position
+        self.add_position(Position(
+            token_id=order.token_id,
+            side='BUY',
+            size=sell_size,
+            entry_price=buy_price,
+        ))
+
+
     async def on_order_update(self, order: OrderInfo) -> None:
         """
         Called when an order changes status (via sync_orders).
@@ -704,44 +753,9 @@ class BtcLowballStrategy(BaseStrategy):
                 f"sell_price={sell_price}  token={order.token_id[:16]}..."
             )
 
-            # Notify Telegram immediately on fill
-            await self._notify(
-                f"\U0001f7e1 <b>BUY FILLED</b>\n"
-                f"Token: {order.token_id[:20]}...\n"
-                f"Buy price: <b>{buy_price}</b>\n"
-                f"Sell target: <b>{sell_price}</b> (×{SELL_MULTIPLIER:.0f})\n"
-                f"Size: {order.size:.2f} shares"
-            )
-
-            await asyncio.sleep(SELL_DELAY_SECONDS)
-
-            # Use the filled quantity directly — no balance lookup needed
-            sell_size = order.size
-
-            logger.info(
-                f"Placing SELL {sell_size:.2f} shares @ {sell_price} "
-                f"(filled size: {sell_size:.4f})"
-            )
-
-            sell_order = await self.place_order(
-                token_id=order.token_id,
-                price=sell_price,
-                size=sell_size,
-                side="SELL",
-            )
-
-            if sell_order:
-                logger.info(f"Sell order placed: {sell_order.order_id}")
-            else:
-                logger.warning(f"Failed to place sell order for token {order.token_id}")
-
-            # Track the position
-            self.add_position(Position(
-                token_id=order.token_id,
-                side='BUY',
-                size=sell_size,
-                entry_price=buy_price,
-            ))
+            # Offload the waiting and sell placement logic to a background task
+            # so we don't block the main loop (or other order updates).
+            asyncio.create_task(self._handle_buy_fill(order, buy_price, sell_price))
 
         elif order.side == 'SELL':
             buy_price = self._order_buy_price.get(order.order_id, order.price / SELL_MULTIPLIER)
