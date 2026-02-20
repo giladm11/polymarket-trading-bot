@@ -36,7 +36,7 @@ from src.config import Config
 from examples.strategy_example import BaseStrategy, Position, OrderInfo, StrategyStatus
 
 # Configuration
-ORDER_PRICE = 0.48
+ORDER_PRICE = 0.40
 SELL_PRICE = 0.99
 MARKET_DURATION = 5        # minutes
 SELL_DELAY_SECONDS = 5     # wait after fill before placing sell
