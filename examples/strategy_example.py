@@ -62,8 +62,8 @@ class OrderInfo:
     side: str
     price: float
     size: float
-    size_matched: float = 0.0
     status: str  # 'pending', 'filled', 'cancelled'
+    size_matched: float = 0.0
     placed_at: datetime = field(default_factory=datetime.now)
 
 
