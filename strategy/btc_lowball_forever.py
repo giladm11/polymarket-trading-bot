@@ -721,7 +721,7 @@ class BtcLowballStrategy(BaseStrategy):
         )
 
         # If placement failed (possibly due to partial fill/size mismatch), try with matched size
-        if not sell_order and hasattr(order, 'size_matched') and order.size_matched > 0 and order.size_matched != sell_size:
+        if not sell_order and hasattr(order, 'size_matched') and order.size_matched > 0:
             logger.info(f"Initial sell placement failed, retrying with matched size: {order.size_matched}")
             sell_size = order.size_matched
             sell_order = await self.place_order(
