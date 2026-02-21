@@ -71,7 +71,8 @@ class ClobAuth(EIP712Struct):
 # --- Rounding helpers (matching official py-clob-client) ---
 
 def _round_down(x: float, sig_digits: int) -> float:
-    return floor(x * (10 ** sig_digits)) / (10 ** sig_digits)
+    val = round(x * (10 ** sig_digits), 6)
+    return floor(val) / (10 ** sig_digits)
 
 
 def _round_normal(x: float, sig_digits: int) -> float:
@@ -79,7 +80,8 @@ def _round_normal(x: float, sig_digits: int) -> float:
 
 
 def _round_up(x: float, sig_digits: int) -> float:
-    return ceil(x * (10 ** sig_digits)) / (10 ** sig_digits)
+    val = round(x * (10 ** sig_digits), 6)
+    return ceil(val) / (10 ** sig_digits)
 
 
 def _to_token_decimals(x: float) -> int:
