@@ -33,6 +33,7 @@ import asyncio
 import logging
 import time
 import os
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -727,7 +728,7 @@ class BaseLowballStrategy(BaseStrategy):
         # If placement failed (possibly due to partial fill/size mismatch), try with matched size
         if not sell_order and hasattr(order, 'size_matched') and order.size_matched > 0:
             logger.info(f"Initial sell placement failed, retrying with matched size: {order.size_matched}")
-            sell_size = order.size_matched
+            sell_size = math.floor(order.size_matched * 100) / 100.0
             sell_order = await self.place_order(
                 token_id=order.token_id,
                 price=sell_price,
