@@ -39,9 +39,9 @@ class GammaClient(ThreadLocalSessionMixin):
     # Which coins support which durations (minutes)
     SUPPORTED_DURATIONS = {
         "BTC": [5, 15],
-        "ETH": [15],
-        "SOL": [15],
-        "XRP": [15],
+        "ETH": [5, 15],
+        "SOL": [5, 15],
+        "XRP": [5, 15],
     }
 
     def __init__(self, host: str = DEFAULT_HOST, timeout: int = 10, duration_minutes: int = 15):

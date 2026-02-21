@@ -36,9 +36,8 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List
-
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add project root directory to path (three levels up from strategy/lowball/script.py)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from dotenv import load_dotenv
 
@@ -64,15 +63,12 @@ ORDER_CANCEL_BEFORE_END = 180  # 210s - 60s offset compensation
 
 SELL_DELAY_SECONDS = 5         # wait after fill before placing sell
 
-# Persistent config file
-CONFIG_FILE = Path(__file__).parent / "bot_config_lowball.json"
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("BTC_Lowball_Strategy")
+logger = logging.getLogger("Base_Lowball_Strategy")
 
 
 # ---------------------------------------------------------------------------
@@ -141,17 +137,19 @@ class TelegramNotifier:
 # Strategy
 # ---------------------------------------------------------------------------
 
-class BtcLowballStrategy(BaseStrategy):
+class BaseLowballStrategy(BaseStrategy):
     """
-    BTC Lowball Grid — Forever Strategy.
+    Base Lowball Grid — Forever Strategy.
 
     Places 4 buy orders at low prices (0.15 / 0.10 / 0.05 / 0.02) on both
     UP and DOWN tokens each cycle.  Fills generate a 4× sell order.
     Unfilled buys are cancelled at cycle_end − 3.5 min.
     """
 
-    def __init__(self, bot: TradingBot, params: Optional[Dict[str, Any]] = None):
-        super().__init__(bot, params or {}, name="BtcLowball")
+    def __init__(self, bot: TradingBot, ticker: str, params: Optional[Dict[str, Any]] = None):
+        super().__init__(bot, params or {}, name=f"{ticker}Lowball")
+        self.ticker = ticker.upper()
+        self.config_file = Path(__file__).parent / f"bot_config_lowball_{self.ticker.lower()}.json"
 
         self.gamma = GammaClient(duration_minutes=MARKET_DURATION)
         self.current_market: Optional[Dict[str, Any]] = None
@@ -220,35 +218,35 @@ class BtcLowballStrategy(BaseStrategy):
     # ------------------------------------------------------------------
 
     def _load_config_value(self, key: str, default):
-        """Load a single value from bot_config_lowball.json, falling back to default."""
+        """Load a single value from config file, falling back to default."""
         import json
         try:
-            if CONFIG_FILE.exists():
-                data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if self.config_file.exists():
+                data = json.loads(self.config_file.read_text(encoding="utf-8"))
                 if key in data:
                     value = type(default)(data[key])
-                    logger.info(f"Loaded {key}={value} from {CONFIG_FILE.name}")
+                    logger.info(f"Loaded {key}={value} from {self.config_file.name}")
                     return value
         except Exception as e:
-            logger.warning(f"Could not read {CONFIG_FILE.name} ({key}): {e}")
+            logger.warning(f"Could not read {self.config_file.name} ({key}): {e}")
         return default
 
     def _save_config(self) -> None:
-        """Persist all runtime-adjustable settings to bot_config_lowball.json."""
+        """Persist all runtime-adjustable settings."""
         import json
         try:
             data = {}
-            if CONFIG_FILE.exists():
+            if self.config_file.exists():
                 try:
-                    data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                    data = json.loads(self.config_file.read_text(encoding="utf-8"))
                 except Exception:
                     pass
             data["lowball_order_amount_usd"] = self.order_amount_usd
             data["balance_report_interval"] = self.balance_report_interval
-            CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            logger.info(f"Config saved to {CONFIG_FILE.name}")
+            self.config_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            logger.info(f"Config saved to {self.config_file.name}")
         except Exception as e:
-            logger.warning(f"Could not save {CONFIG_FILE.name}: {e}")
+            logger.warning(f"Could not save {self.config_file.name}: {e}")
 
     # ------------------------------------------------------------------
     # Order placement (dry-run aware)
@@ -576,13 +574,13 @@ class BtcLowballStrategy(BaseStrategy):
 
     async def _try_enter_next_market(self) -> None:
         """
-        Look for the next upcoming BTC 5-min market and place grid orders
+        Look for the next upcoming token 5-min market and place grid orders
         if we haven't already entered that cycle.
         """
         if self._entering:
             return
 
-        market = self.gamma.get_next_market("BTC")
+        market = self.gamma.get_next_market(self.ticker)
         if not market:
             return
         if not market.get("acceptingOrders", False):
@@ -796,10 +794,15 @@ class BtcLowballStrategy(BaseStrategy):
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry point Helper
 # ---------------------------------------------------------------------------
 
-async def main():
+def run_strategy(ticker: str):
+    """Entry point helper for specific ticker strategies."""
+    # Update logger name dynamically for better context
+    global logger
+    logger = logging.getLogger(f"{ticker}_Lowball_Strategy")
+
     load_dotenv()
     private_key = os.environ.get("POLY_PRIVATE_KEY")
     if not private_key:
@@ -812,18 +815,15 @@ async def main():
     if not bot.config.use_gasless:
         logger.warning("Gasless mode not enabled")
 
-    strategy = BtcLowballStrategy(bot, params={"check_interval": 1})
+    strategy = BaseLowballStrategy(bot, ticker=ticker, params={"check_interval": 1})
 
-    logger.info("Starting BTC Lowball Grid Strategy (Forever)...")
+    logger.info(f"Starting {ticker} Lowball Grid Strategy (Forever)...")
     logger.info(f"Buy levels: {BUY_PRICES}")
     logger.info(f"Sell multiplier: {SELL_MULTIPLIER}x  →  sell prices: {[round(p * SELL_MULTIPLIER, 4) for p in BUY_PRICES]}")
     logger.info(f"Orders cancel at: cycle_end − {ORDER_CANCEL_BEFORE_END}s (3.5 min before end)")
 
-    await strategy.run(token_ids=[], duration=None)
-
-
-if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(strategy.run(token_ids=[], duration=None))
     except KeyboardInterrupt:
         print("\nStopping...")
+
