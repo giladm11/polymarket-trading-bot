@@ -262,6 +262,7 @@ class BtcLowballStrategy(BaseStrategy):
         side: str,
         order_type: str = "GTC",
         expiration: int = 0,
+        send_error_to_telegram: bool = True,
     ):
         """Place an order, or simulate it in dry-run mode."""
         if self.dry_run:
@@ -294,7 +295,8 @@ class BtcLowballStrategy(BaseStrategy):
             log_msg = f"Order placement failed: {error_msg} (side: {side}, size: {size}, price: {price})"
             logger.warning(log_msg)
             safe_error_msg = html.escape(str(error_msg))
-            await self._notify(f"\u274c <b>ORDER FAILED:</b> {safe_error_msg}\nSide: {side}\nSize: {size}\nPrice: {price}")
+            if send_error_to_telegram:
+                await self._notify(f"\u274c <b>ORDER FAILED:</b> {safe_error_msg}\nSide: {side}\nSize: {size}\nPrice: {price}")
             return None
 
         order_info = OrderInfo(
@@ -721,6 +723,7 @@ class BtcLowballStrategy(BaseStrategy):
             price=sell_price,
             size=sell_size,
             side="SELL",
+            send_error_to_telegram=False,
         )
 
         # If placement failed (possibly due to partial fill/size mismatch), try with matched size
