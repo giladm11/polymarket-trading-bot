@@ -784,11 +784,14 @@ class BaseLowballStrategy(BaseStrategy):
                 f"profit_estimate=${profit_estimate:.4f}"
             )
 
+            balance = await self.bot.get_balance()
+
             await self._notify(
                 f"\U0001f7e2 <b>SELL FILLED — Profit secured!</b>\n"
                 f"Sell price: <b>{sell_price}</b>\n"
                 f"Size: {order.size:.2f} shares\n"
-                f"Est. profit: <b>${profit_estimate:.4f}</b>"
+                f"Est. profit: <b>${profit_estimate:.4f}</b>\n"
+                f"Current balance: <b>${balance:.2f} USDC</b>"
             )
 
             self.close_position(order.token_id, 'BUY')
