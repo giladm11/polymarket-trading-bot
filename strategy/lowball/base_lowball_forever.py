@@ -734,6 +734,7 @@ class BaseLowballStrategy(BaseStrategy):
                 price=sell_price,
                 size=sell_size,
                 side="SELL",
+                send_error_to_telegram=False,
             )
 
             # Final desperate retry: amount - 1 share (to handle potential off-by-one balance/allowance issues)
