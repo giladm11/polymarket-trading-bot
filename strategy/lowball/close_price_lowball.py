@@ -8,6 +8,9 @@ against the target price (price at market start).
 If in the last minute of the market, the difference is within the threshold:
   - Place UP and DOWN orders at 0.10
   - If filled, place a SELL order at 0.70
+
+
+  python strategy/lowball/close_price_lowball.py BTC
 """
 
 import sys

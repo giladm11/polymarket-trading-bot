@@ -42,6 +42,7 @@ credentials/
 strategy/bot_config.json
 strategy/bot_config_lowball.json
 strategy/lowball/bot_config_lowball_*.json
+strategy/lowball/bot_config_*.json
 
 # Logs and local data
 *.log
