@@ -51,9 +51,16 @@ from examples.strategy_example import BaseStrategy, Position, OrderInfo, Strateg
 # Strategy constants
 # ---------------------------------------------------------------------------
 
-# Buy prices for the 4 grid levels and their corresponding sell multiplier
+# Buy prices for the grid levels and their corresponding sell multipliers
 BUY_PRICES = [0.10, 0.09, 0.08, 0.07, 0.06, 0.05]
-SELL_MULTIPLIER = 2          # sell price = buy price × SELL_MULTIPLIER
+PRICE_MULTIPLIERS = {
+    0.10: 2.5,
+    0.09: 2,
+    0.08: 2.5,
+    0.07: 3,
+    0.06: 3,
+    0.05: 4,
+}
 
 MARKET_DURATION = 5            # minutes per cycle
 # Orders are cancelled this many seconds before cycle end if still open.
@@ -427,7 +434,8 @@ class BaseLowballStrategy(BaseStrategy):
                     elif command == "/levels":
                         lines = [f"<b>[{self.name}]</b> \U0001f4ca <b>Price levels:</b>"]
                         for bp in BUY_PRICES:
-                            sp = round(bp * SELL_MULTIPLIER, 4)
+                            mult = PRICE_MULTIPLIERS.get(bp, 2)
+                            sp = round(bp * mult, 4)
                             cost = round(self.order_amount_usd / bp, 2)
                             lines.append(f"  Buy @ <b>{bp}</b> → Sell @ <b>{sp}</b>  (size ≈ {cost} shares)")
                         reply = "\n".join(lines) + dry_tag
@@ -698,11 +706,12 @@ class BaseLowballStrategy(BaseStrategy):
         - Update position tracking
         """
         # Notify Telegram immediately on fill
+        mult = PRICE_MULTIPLIERS.get(buy_price, 2)
         await self._notify(
             f"\U0001f7e1 <b>BUY FILLED</b>\n"
             f"Token: {order.token_id[:20]}...\n"
             f"Buy price: <b>{buy_price}</b>\n"
-            f"Sell target: <b>{sell_price}</b> (×{SELL_MULTIPLIER:.0f})\n"
+            f"Sell target: <b>{sell_price}</b> (×{mult})\n"
             f"Size: {order.size:.2f} shares"
         )
 
@@ -744,6 +753,7 @@ class BaseLowballStrategy(BaseStrategy):
             )
 
         if sell_order:
+            self._order_buy_price[sell_order.order_id] = buy_price
             logger.info(f"Sell order placed: {sell_order.order_id}")
         else:
             logger.warning(f"Failed to place sell order for token {order.token_id} (even after size retry)")
@@ -770,7 +780,8 @@ class BaseLowballStrategy(BaseStrategy):
 
         if order.side == 'BUY':
             buy_price = self._order_buy_price.get(order.order_id, order.price)
-            sell_price = round(buy_price * SELL_MULTIPLIER, 4)
+            mult = PRICE_MULTIPLIERS.get(buy_price, 2)
+            sell_price = round(buy_price * mult, 4)
 
             logger.info(
                 f"BUY filled! order_id={order.order_id}  buy_price={buy_price}  "
@@ -782,7 +793,8 @@ class BaseLowballStrategy(BaseStrategy):
             asyncio.create_task(self._handle_buy_fill(order, buy_price, sell_price))
 
         elif order.side == 'SELL':
-            buy_price = self._order_buy_price.get(order.order_id, order.price / SELL_MULTIPLIER)
+            # Try to get exact buy price, fallback to estimating with / 2
+            buy_price = self._order_buy_price.get(order.order_id, order.price / 2)
             sell_price = order.price
             profit_estimate = (sell_price - buy_price) * order.size
 
@@ -830,7 +842,8 @@ def run_strategy(ticker: str):
 
     logger.info(f"Starting {ticker} Lowball Grid Strategy (Forever)...")
     logger.info(f"Buy levels: {BUY_PRICES}")
-    logger.info(f"Sell multiplier: {SELL_MULTIPLIER}x  →  sell prices: {[round(p * SELL_MULTIPLIER, 4) for p in BUY_PRICES]}")
+    sell_prices = [round(p * PRICE_MULTIPLIERS.get(p, 2), 4) for p in BUY_PRICES]
+    logger.info(f"Multipliers mapping: {PRICE_MULTIPLIERS}  →  sell prices: {sell_prices}")
     logger.info(f"Orders cancel at: cycle_end − {ORDER_CANCEL_BEFORE_END}s (3.5 min before end)")
 
     try:
