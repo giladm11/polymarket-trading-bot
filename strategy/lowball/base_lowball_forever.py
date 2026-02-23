@@ -737,6 +737,8 @@ class BaseLowballStrategy(BaseStrategy):
                 send_error_to_telegram=False,
             )
 
+            await asyncio.sleep(SELL_DELAY_SECONDS)
+
             # Final desperate retry: amount - 1 share (to handle potential off-by-one balance/allowance issues)
             if not sell_order:
                 sell_size = math.floor((sell_size - 0.05))
