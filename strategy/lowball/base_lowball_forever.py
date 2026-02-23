@@ -728,10 +728,6 @@ class BaseLowballStrategy(BaseStrategy):
         )
 
 
-        if hasattr(order, 'size_matched') and order.size_matched > 0:
-            sell_size = math.floor(order.size_matched * 100) / 100.0
-
-
         sell_order = await self.place_order(
             token_id=order.token_id,
             price=sell_price,
