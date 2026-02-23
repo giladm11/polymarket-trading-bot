@@ -727,14 +727,25 @@ class BaseLowballStrategy(BaseStrategy):
 
         # If placement failed (possibly due to partial fill/size mismatch), try with matched size
         if not sell_order and hasattr(order, 'size_matched') and order.size_matched > 0:
-            logger.info(f"Initial sell placement failed, retrying with matched size: {order.size_matched}")
             sell_size = math.floor(order.size_matched * 100) / 100.0
+            logger.info(f"Initial sell placement failed, retrying with matched size: {sell_size}")
             sell_order = await self.place_order(
                 token_id=order.token_id,
                 price=sell_price,
                 size=sell_size,
                 side="SELL",
             )
+
+            # Final desperate retry: amount - 1 share (to handle potential off-by-one balance/allowance issues)
+            if not sell_order:
+                sell_size = math.floor((sell_size - 0.05))
+                logger.info(f"Sell still failing, retrying with flooring: {sell_size}")
+                sell_order = await self.place_order(
+                    token_id=order.token_id,
+                    price=sell_price,
+                    size=sell_size,
+                    side="SELL",
+                )
 
         if sell_order:
             logger.info(f"Sell order placed: {sell_order.order_id}")
