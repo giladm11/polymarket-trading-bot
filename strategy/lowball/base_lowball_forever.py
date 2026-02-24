@@ -69,7 +69,7 @@ MARKET_DURATION = 5            # minutes per cycle
 #   150s here  +  60s API offset  =  210s = 3.5 min before actual cycle end.
 ORDER_CANCEL_BEFORE_END = 180  # 210s - 60s offset compensation
 
-SELL_DELAY_SECONDS = 5         # wait after fill before placing sell
+SELL_DELAY_SECONDS = 3         # wait after fill before placing sell
 
 # Configure logging
 logging.basicConfig(
@@ -728,25 +728,38 @@ class BaseLowballStrategy(BaseStrategy):
         )
 
 
-        sell_order = await self.place_order(
-            token_id=order.token_id,
-            price=sell_price,
-            size=sell_size,
-            side="SELL",
-            send_error_to_telegram=False,
-        )
-
-
-        # Final desperate retry: amount - 1 share (to handle potential off-by-one balance/allowance issues)
-        if not sell_order:
-            sell_size = math.floor((sell_size - 0.05))
-            logger.info(f"Sell still failing, retrying with flooring: {sell_size}")
+        sell_order = None
+        floored_size = math.floor((sell_size - 0.05))
+        
+        for attempt in range(7):
+            # Try regular size
             sell_order = await self.place_order(
                 token_id=order.token_id,
                 price=sell_price,
                 size=sell_size,
                 side="SELL",
+                send_error_to_telegram=False,
             )
+            if sell_order:
+                break
+            
+            logger.info(f"Sell try {attempt + 1}/6 failed without flooring, trying with flooring: {floored_size}")
+            
+            # Try floored size
+            sell_order = await self.place_order(
+                token_id=order.token_id,
+                price=sell_price,
+                size=floored_size,
+                side="SELL",
+                send_error_to_telegram=(attempt == 5),
+            )
+            if sell_order:
+                # Update sell_size so it's recorded correctly if it succeeds here
+                sell_size = floored_size
+                break
+                
+            logger.info(f"Flooring retry {attempt + 1}/6 failed, sleeping 1 second...")
+            await asyncio.sleep(1)
 
         if sell_order:
             self._order_buy_price[sell_order.order_id] = buy_price

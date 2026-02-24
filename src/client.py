@@ -93,7 +93,7 @@ class ApiClient(ThreadLocalSessionMixin):
         self,
         base_url: str,
         timeout: int = 30,
-        retry_count: int = 3
+        retry_count: int = 1
     ):
         """
         Initialize API client.
