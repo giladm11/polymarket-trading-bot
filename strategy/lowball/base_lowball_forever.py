@@ -53,7 +53,7 @@ from examples.strategy_example import BaseStrategy, Position, OrderInfo, Strateg
 
 # Buy prices and their fractioned sell targets
 BUY_PRICES = [0.05]
-SELL_TARGETS = [0.20, 0.25, 0.30, 0.99]
+SELL_TARGETS = [0.20, 0.25, 0.30, 0.35]
 
 MARKET_DURATION = 5            # minutes per cycle
 # Orders are cancelled this many seconds before cycle end if still open.
