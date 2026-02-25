@@ -52,11 +52,11 @@ from examples.strategy_example import BaseStrategy, Position, OrderInfo, Strateg
 # ---------------------------------------------------------------------------
 
 # Buy prices for the grid levels and their corresponding sell multipliers
-BUY_PRICES = [0.10, 0.09, 0.08, 0.07, 0.06, 0.05]
+BUY_PRICES = [0.07, 0.06, 0.05]
 PRICE_MULTIPLIERS = {
-    0.10: 2.5,
-    0.09: 2,
-    0.08: 2.5,
+    # 0.10: 2.5,
+    # 0.09: 2,
+    # 0.08: 2.5,
     0.07: 3,
     0.06: 3,
     0.05: 4,
