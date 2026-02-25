@@ -176,6 +176,10 @@ class BaseLowballStrategy(BaseStrategy):
             float(os.environ.get("ORDER_AMOUNT_USD", "2"))
         )
 
+        # Sell targets
+        loaded_targets = self._load_config_value("sell_targets", SELL_TARGETS)
+        self.sell_targets = [float(t) for t in loaded_targets]
+
         # Balance report interval
         self.balance_report_interval: float = self._load_config_value(
             "balance_report_interval", 3600.0 * 60
@@ -244,6 +248,7 @@ class BaseLowballStrategy(BaseStrategy):
                 except Exception:
                     pass
             data["lowball_order_amount_usd"] = self.order_amount_usd
+            data["sell_targets"] = self.sell_targets
             data["balance_report_interval"] = self.balance_report_interval
             self.config_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
             logger.info(f"Config saved to {self.config_file.name}")
@@ -346,6 +351,8 @@ class BaseLowballStrategy(BaseStrategy):
             "/size — current order size per price level\n"
             f"/setsize &lt;amount&gt; — set order size per level (e.g. /setsize 2)\n"
             f"  ({num_levels} levels × 2 sides = {num_levels * 2} orders, prices: {prices_str})\n"
+            "/targets — current sell targets\n"
+            "/settargets &lt;t1&gt; &lt;t2&gt; ... — set targets (e.g. /settargets 0.20 0.25 0.30)\n"
             "/interval — current balance report interval\n"
             "/setinterval &lt;minutes&gt; — set report interval (e.g. /setinterval 30)\n"
             "/levels — show current price levels & sell targets"
@@ -425,8 +432,37 @@ class BaseLowballStrategy(BaseStrategy):
                             except ValueError as e:
                                 reply = f"\u274c Invalid value: {e}"
 
+                    elif command == "/targets":
+                        targets_str = " / ".join(str(t) for t in self.sell_targets)
+                        reply = (
+                            f"<b>[{self.name}]</b> \U0001f3af Current sell targets:\n"
+                            f"<b>{targets_str}</b>\n"
+                            f"({len(self.sell_targets)} targets, {100.0/len(self.sell_targets):.1f}% of matched size each){dry_tag}"
+                        )
+
+                    elif command == "/settargets":
+                        if not args:
+                            reply = "\u274c Usage: /settargets &lt;t1&gt; &lt;t2&gt; ...  (e.g. /settargets 0.20 0.25 0.30)"
+                        else:
+                            try:
+                                new_targets = [float(x) for x in args]
+                                if any(t <= 0 or t >= 1 for t in new_targets):
+                                    raise ValueError("targets must be between 0 and 1")
+                                old_str = " / ".join(str(t) for t in self.sell_targets)
+                                self.sell_targets = new_targets
+                                self._save_config()
+                                new_str = " / ".join(str(t) for t in self.sell_targets)
+                                logger.info(f"Sell targets changed via Telegram: {old_str} -> {new_str}")
+                                reply = (
+                                    f"<b>[{self.name}]</b> \u2705 Sell targets updated:\n"
+                                    f"<b>{old_str}</b> \u2192 <b>{new_str}</b>\n"
+                                    f"({len(self.sell_targets)} targets, {100.0/len(self.sell_targets):.1f}% of matched size each){dry_tag}"
+                                )
+                            except ValueError as e:
+                                reply = f"\u274c Invalid targets: {e}"
+
                     elif command == "/levels":
-                        targets_str = " / ".join(str(t) for t in SELL_TARGETS)
+                        targets_str = " / ".join(str(t) for t in self.sell_targets)
                         lines = [f"<b>[{self.name}]</b> \U0001f4ca <b>Price levels:</b>"]
                         for bp in BUY_PRICES:
                             cost = round(self.order_amount_usd / bp, 2)
@@ -699,9 +735,10 @@ class BaseLowballStrategy(BaseStrategy):
         - Update position tracking
         """
         # Notify Telegram immediately on fill
-        targets_str = " / ".join(str(t) for t in SELL_TARGETS)
+        targets_str = " / ".join(str(t) for t in self.sell_targets)
+        now_str = datetime.now(timezone.utc).strftime('%H:%M:%S UTC')
         await self._notify(
-            f"\U0001f7e1 <b>BUY FILLED</b>\n"
+            f"\U0001f7e1 <b>BUY FILLED at {now_str}</b>\n"
             f"Token: {order.token_id[:20]}...\n"
             f"Buy price: <b>{buy_price}</b>\n"
             f"Sell targets: <b>{targets_str}</b>\n"
@@ -714,11 +751,11 @@ class BaseLowballStrategy(BaseStrategy):
 
         total_sell_size = math.floor(order.size_matched * 100) / 100.0
         
-        chunk_size_raw = order.size_matched / len(SELL_TARGETS)
+        chunk_size_raw = order.size_matched / len(self.sell_targets)
         chunk_size = math.floor(chunk_size_raw * 100) / 100.0
 
 
-        for sell_price in SELL_TARGETS:
+        for sell_price in self.sell_targets:
             logger.info(
                 f"Placing SELL {chunk_size:.2f} shares @ {sell_price} "
                 f"(filled size: {total_sell_size:.4f})"
@@ -847,7 +884,7 @@ def run_strategy(ticker: str):
 
     logger.info(f"Starting {ticker} Lowball Grid Strategy (Forever)...")
     logger.info(f"Buy levels: {BUY_PRICES}")
-    logger.info(f"Sell targets: {SELL_TARGETS}")
+    logger.info(f"Sell targets: {strategy.sell_targets}")
     logger.info(f"Orders cancel at: cycle_end − {ORDER_CANCEL_BEFORE_END}s (3.5 min before end)")
 
     try:
