@@ -51,16 +51,9 @@ from examples.strategy_example import BaseStrategy, Position, OrderInfo, Strateg
 # Strategy constants
 # ---------------------------------------------------------------------------
 
-# Buy prices for the grid levels and their corresponding sell multipliers
-BUY_PRICES = [0.07, 0.06, 0.05]
-PRICE_MULTIPLIERS = {
-    # 0.10: 2.5,
-    # 0.09: 2,
-    # 0.08: 2.5,
-    0.07: 3,
-    0.06: 3,
-    0.05: 4,
-}
+# Buy prices and their fractioned sell targets
+BUY_PRICES = [0.05]
+SELL_TARGETS = [0.20, 0.25, 0.30, 0.99]
 
 MARKET_DURATION = 5            # minutes per cycle
 # Orders are cancelled this many seconds before cycle end if still open.
@@ -432,12 +425,11 @@ class BaseLowballStrategy(BaseStrategy):
                                 reply = f"\u274c Invalid value: {e}"
 
                     elif command == "/levels":
+                        targets_str = " / ".join(str(t) for t in SELL_TARGETS)
                         lines = [f"<b>[{self.name}]</b> \U0001f4ca <b>Price levels:</b>"]
                         for bp in BUY_PRICES:
-                            mult = PRICE_MULTIPLIERS.get(bp, 2)
-                            sp = round(bp * mult, 4)
                             cost = round(self.order_amount_usd / bp, 2)
-                            lines.append(f"  Buy @ <b>{bp}</b> → Sell @ <b>{sp}</b>  (size ≈ {cost} shares)")
+                            lines.append(f"  Buy @ <b>{bp}</b> → Sell targets: <b>{targets_str}</b> (size ≈ {cost} shares)")
                         reply = "\n".join(lines) + dry_tag
 
                     elif command in ("/help", "/start"):
@@ -697,21 +689,21 @@ class BaseLowballStrategy(BaseStrategy):
     # Order updates
     # ------------------------------------------------------------------
 
-    async def _handle_buy_fill(self, order: OrderInfo, buy_price: float, sell_price: float) -> None:
+    async def _handle_buy_fill(self, order: OrderInfo, buy_price: float) -> None:
         """
         Handle post-fill logic for BUY orders in the background:
         - Notify Telegram
-        - Wait 5 seconds
-        - Place matching SELL order
+        - Wait 3 seconds
+        - Place 4 matching SELL orders
         - Update position tracking
         """
         # Notify Telegram immediately on fill
-        mult = PRICE_MULTIPLIERS.get(buy_price, 2)
+        targets_str = " / ".join(str(t) for t in SELL_TARGETS)
         await self._notify(
             f"\U0001f7e1 <b>BUY FILLED</b>\n"
             f"Token: {order.token_id[:20]}...\n"
             f"Buy price: <b>{buy_price}</b>\n"
-            f"Sell target: <b>{sell_price}</b> (×{mult})\n"
+            f"Sell targets: <b>{targets_str}</b>\n"
             f"Size: {order.size:.2f} shares"
         )
 
@@ -719,60 +711,64 @@ class BaseLowballStrategy(BaseStrategy):
         await asyncio.sleep(SELL_DELAY_SECONDS)
 
 
-        sell_size = math.floor(order.size_matched * 100) / 100.0
-
-
-        logger.info(
-            f"Placing SELL {sell_size:.2f} shares @ {sell_price} "
-            f"(filled size: {sell_size:.4f})"
-        )
-
-
-        sell_order = None
-        floored_size = math.floor((sell_size - 0.05))
+        total_sell_size = math.floor(order.size_matched * 100) / 100.0
         
-        for attempt in range(7):
-            # Try regular size
-            sell_order = await self.place_order(
-                token_id=order.token_id,
-                price=sell_price,
-                size=sell_size,
-                side="SELL",
-                send_error_to_telegram=False,
-            )
-            if sell_order:
-                break
-            
-            logger.info(f"Sell try {attempt + 1}/6 failed without flooring, trying with flooring: {floored_size}")
-            
-            # Try floored size
-            sell_order = await self.place_order(
-                token_id=order.token_id,
-                price=sell_price,
-                size=floored_size,
-                side="SELL",
-                send_error_to_telegram=(attempt == 5),
-            )
-            if sell_order:
-                # Update sell_size so it's recorded correctly if it succeeds here
-                sell_size = floored_size
-                break
-                
-            logger.info(f"Flooring retry {attempt + 1}/6 failed, sleeping 1 second...")
-            await asyncio.sleep(1)
+        chunk_size_raw = order.size_matched / len(SELL_TARGETS)
+        chunk_size = math.floor(chunk_size_raw * 100) / 100.0
 
-        if sell_order:
-            self._order_buy_price[sell_order.order_id] = buy_price
-            logger.info(f"Sell order placed: {sell_order.order_id}")
-        else:
-            logger.warning(f"Failed to place sell order for token {order.token_id} (even after size retry)")
-            await self._notify(f"\u26a0\ufe0f <b>SELL FAILED:</b> Could not place auto-sell for {order.token_id[:16]}... even after retrying.")
+
+        for sell_price in SELL_TARGETS:
+            logger.info(
+                f"Placing SELL {chunk_size:.2f} shares @ {sell_price} "
+                f"(filled size: {total_sell_size:.4f})"
+            )
+
+
+            sell_order = None
+            floored_size = math.floor((chunk_size - 0.05))
+            
+            for attempt in range(7):
+                # Try regular size
+                sell_order = await self.place_order(
+                    token_id=order.token_id,
+                    price=sell_price,
+                    size=chunk_size,
+                    side="SELL",
+                    send_error_to_telegram=False,
+                )
+                if sell_order:
+                    break
+                
+                logger.info(f"Sell try {attempt + 1}/6 failed without flooring, trying with flooring: {floored_size}")
+                
+                # Try floored size
+                sell_order = await self.place_order(
+                    token_id=order.token_id,
+                    price=sell_price,
+                    size=floored_size,
+                    side="SELL",
+                    send_error_to_telegram=(attempt == 5),
+                )
+                if sell_order:
+                    # Update sell_size so it's recorded correctly if it succeeds here
+                    chunk_size = floored_size
+                    break
+                    
+                logger.info(f"Flooring retry {attempt + 1}/6 failed, sleeping 1 second...")
+                await asyncio.sleep(1)
+
+            if sell_order:
+                self._order_buy_price[sell_order.order_id] = buy_price
+                logger.info(f"Sell order placed: {sell_order.order_id}")
+            else:
+                logger.warning(f"Failed to place sell order for token {order.token_id} at price {sell_price} (even after size retry)")
+                await self._notify(f"\u26a0\ufe0f <b>SELL FAILED:</b> Could not place auto-sell for {order.token_id[:16]}... at price {sell_price} even after retrying.")
 
         # Track the position
         self.add_position(Position(
             token_id=order.token_id,
             side='BUY',
-            size=sell_size,
+            size=total_sell_size,
             entry_price=buy_price,
         ))
 
@@ -789,17 +785,15 @@ class BaseLowballStrategy(BaseStrategy):
 
         if order.side == 'BUY':
             buy_price = self._order_buy_price.get(order.order_id, order.price)
-            mult = PRICE_MULTIPLIERS.get(buy_price, 2)
-            sell_price = round(buy_price * mult, 4)
 
             logger.info(
                 f"BUY filled! order_id={order.order_id}  buy_price={buy_price}  "
-                f"sell_price={sell_price}  token={order.token_id[:16]}..."
+                f"token={order.token_id[:16]}..."
             )
 
             # Offload the waiting and sell placement logic to a background task
             # so we don't block the main loop (or other order updates).
-            asyncio.create_task(self._handle_buy_fill(order, buy_price, sell_price))
+            asyncio.create_task(self._handle_buy_fill(order, buy_price))
 
         elif order.side == 'SELL':
             # Try to get exact buy price, fallback to estimating with / 2
@@ -851,8 +845,7 @@ def run_strategy(ticker: str):
 
     logger.info(f"Starting {ticker} Lowball Grid Strategy (Forever)...")
     logger.info(f"Buy levels: {BUY_PRICES}")
-    sell_prices = [round(p * PRICE_MULTIPLIERS.get(p, 2), 4) for p in BUY_PRICES]
-    logger.info(f"Multipliers mapping: {PRICE_MULTIPLIERS}  →  sell prices: {sell_prices}")
+    logger.info(f"Sell targets: {SELL_TARGETS}")
     logger.info(f"Orders cancel at: cycle_end − {ORDER_CANCEL_BEFORE_END}s (3.5 min before end)")
 
     try:
