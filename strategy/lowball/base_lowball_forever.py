@@ -63,6 +63,7 @@ MARKET_DURATION = 5            # minutes per cycle
 ORDER_CANCEL_BEFORE_END = 180  # 210s - 60s offset compensation
 
 SELL_DELAY_SECONDS = 3         # wait after fill before placing sell
+SELL_ORDER_RETRY_ATTEMPTS = 7
 
 # Configure logging
 logging.basicConfig(
@@ -727,7 +728,8 @@ class BaseLowballStrategy(BaseStrategy):
             sell_order = None
             floored_size = math.floor((chunk_size - 0.05))
             
-            for attempt in range(7):
+            
+            for attempt in range(SELL_ORDER_RETRY_ATTEMPTS):
                 # Try regular size
                 sell_order = await self.place_order(
                     token_id=order.token_id,
@@ -747,7 +749,7 @@ class BaseLowballStrategy(BaseStrategy):
                     price=sell_price,
                     size=floored_size,
                     side="SELL",
-                    send_error_to_telegram=(attempt == 5),
+                    send_error_to_telegram=(attempt == SELL_ORDER_RETRY_ATTEMPTS - 1),
                 )
                 if sell_order:
                     # Update sell_size so it's recorded correctly if it succeeds here
