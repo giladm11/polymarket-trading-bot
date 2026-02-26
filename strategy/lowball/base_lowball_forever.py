@@ -60,7 +60,7 @@ MARKET_DURATION = 5            # minutes per cycle
 # NOTE: Gamma's endDate is systematically ~60s ahead of the real market close,
 # so we subtract 60s from the intended 3.5 min (210s) window to compensate:
 #   150s here  +  60s API offset  =  210s = 3.5 min before actual cycle end.
-ORDER_CANCEL_BEFORE_END = 180  # 210s - 60s offset compensation
+ORDER_CANCEL_BEFORE_END = 0  # 210s - 60s offset compensation
 
 SELL_DELAY_SECONDS = 3         # wait after fill before placing sell
 SELL_ORDER_RETRY_ATTEMPTS = 7
@@ -755,53 +755,10 @@ class BaseLowballStrategy(BaseStrategy):
         chunk_size = math.floor(chunk_size_raw * 100) / 100.0
 
 
-        for sell_price in self.sell_targets:
-            logger.info(
-                f"Placing SELL {chunk_size:.2f} shares @ {sell_price} "
-                f"(filled size: {total_sell_size:.4f})"
-            )
 
-
-            sell_order = None
-            floored_size = math.floor((chunk_size - 0.05))
-            
-            
-            for attempt in range(SELL_ORDER_RETRY_ATTEMPTS):
-                # Try regular size
-                sell_order = await self.place_order(
-                    token_id=order.token_id,
-                    price=sell_price,
-                    size=chunk_size,
-                    side="SELL",
-                    send_error_to_telegram=False,
-                )
-                if sell_order:
-                    break
-                
-                logger.info(f"Sell try {attempt + 1}/6 failed without flooring, trying with flooring: {floored_size}")
-                
-                # Try floored size
-                sell_order = await self.place_order(
-                    token_id=order.token_id,
-                    price=sell_price,
-                    size=floored_size,
-                    side="SELL",
-                    send_error_to_telegram=(attempt == SELL_ORDER_RETRY_ATTEMPTS - 1),
-                )
-                if sell_order:
-                    # Update sell_size so it's recorded correctly if it succeeds here
-                    chunk_size = floored_size
-                    break
-                    
-                logger.info(f"Flooring retry {attempt + 1}/6 failed, sleeping 1 second...")
-                await asyncio.sleep(1)
-
-            if sell_order:
-                self._order_buy_price[sell_order.order_id] = buy_price
-                logger.info(f"Sell order placed: {sell_order.order_id}")
-            else:
-                logger.warning(f"Failed to place sell order for token {order.token_id} at price {sell_price} (even after size retry)")
-                await self._notify(f"\u26a0\ufe0f <b>SELL FAILED:</b> Could not place auto-sell for {order.token_id[:16]}... at price {sell_price} even after retrying.")
+        tasks = [asyncio.create_task(self.place_sell_target(sp, chunk_size, order, total_sell_size, buy_price)) for sp in self.sell_targets]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         # Track the position
         self.add_position(Position(
@@ -810,6 +767,54 @@ class BaseLowballStrategy(BaseStrategy):
             size=total_sell_size,
             entry_price=buy_price,
         ))
+
+    async def place_sell_target(self, sell_price: float, chunk_size: float, order: OrderInfo, total_sell_size: float, buy_price: float):
+        logger.info(
+            f"Placing SELL {chunk_size:.2f} shares @ {sell_price} "
+            f"(filled size: {total_sell_size:.4f})"
+        )
+
+
+        sell_order = None
+        floored_size = math.floor((chunk_size - 0.05))
+        
+        
+        for attempt in range(SELL_ORDER_RETRY_ATTEMPTS):
+            # Try regular size
+            sell_order = await self.place_order(
+                token_id=order.token_id,
+                price=sell_price,
+                size=chunk_size,
+                side="SELL",
+                send_error_to_telegram=False,
+            )
+            if sell_order:
+                break
+            
+            logger.info(f"Sell try {attempt + 1}/6 failed without flooring, trying with flooring: {floored_size}")
+                
+            # Try floored size
+            sell_order = await self.place_order(
+                token_id=order.token_id,
+                price=sell_price,
+                size=floored_size,
+                side="SELL",
+                send_error_to_telegram=(attempt == SELL_ORDER_RETRY_ATTEMPTS - 1),
+            )
+            
+            if sell_order:
+                break
+            
+            logger.info(f"Flooring retry {attempt}/6 , sleeping 1 second...")
+            await asyncio.sleep(1)
+
+        if sell_order:
+            self._order_buy_price[sell_order.order_id] = buy_price
+            logger.info(f"Sell order placed: {sell_order.order_id}")
+        else:
+            logger.warning(f"Failed to place sell order for token {order.token_id} at price {sell_price} (even after size retry)")
+            await self._notify(f"\u26a0\ufe0f <b>SELL FAILED:</b> Could not place auto-sell for {order.token_id[:16]}... at price {sell_price} even after retrying.")
+
 
 
     async def on_order_update(self, order: OrderInfo) -> None:
