@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from dotenv import load_dotenv
 
-from src.bot import TradingBot, OrderResult, OrderSide
+from src.bot import TradingBot
 from src.gamma_client import GammaClient
 from src.config import Config
 from examples.strategy_example import BaseStrategy, Position, OrderInfo, StrategyStatus
@@ -60,7 +60,7 @@ MARKET_DURATION = 5            # minutes per cycle
 # NOTE: Gamma's endDate is systematically ~60s ahead of the real market close,
 # so we subtract 60s from the intended 3.5 min (210s) window to compensate:
 #   150s here  +  60s API offset  =  210s = 3.5 min before actual cycle end.
-ORDER_CANCEL_BEFORE_END = 0  # 210s - 60s offset compensation
+ORDER_CANCEL_BEFORE_END = 210  # 210s - 60s offset compensation
 
 SELL_DELAY_SECONDS = 3         # wait after fill before placing sell
 SELL_ORDER_RETRY_ATTEMPTS = 7
@@ -566,45 +566,45 @@ class BaseLowballStrategy(BaseStrategy):
             self._order_buy_price.clear()
 
         # 2. Cancel resting buys 3.5 min before cycle end
-        if (
-            self.cycle_active
-            and not self._buys_cancelled
-            and now >= self.cycle_end_time - ORDER_CANCEL_BEFORE_END
-        ):
-            await self._cancel_resting_buys()
+        # if (
+        #     self.cycle_active
+        #     and not self._buys_cancelled
+        #     and now >= self.cycle_end_time - ORDER_CANCEL_BEFORE_END
+        # ):
+        #     await self._cancel_resting_buys()
 
         # 3. Try to enter the next market (pre-place orders)
         await self._try_enter_next_market()
 
-    async def _cancel_resting_buys(self) -> None:
-        """
-        Cancel all still-open BUY orders for the current cycle.
-        Called at cycle_end − 3.5 min.
-        """
-        self._buys_cancelled = True
-        cancel_time = datetime.fromtimestamp(self.cycle_end_time - ORDER_CANCEL_BEFORE_END)
-        logger.info(
-            f"Cancelling resting buy orders at {cancel_time} "
-            f"(3.5 min before cycle end {datetime.fromtimestamp(self.cycle_end_time)})"
-        )
+    # async def _cancel_resting_buys(self) -> None:
+    #     """
+    #     Cancel all still-open BUY orders for the current cycle.
+    #     Called at cycle_end − 3.5 min.
+    #     """
+    #     self._buys_cancelled = True
+    #     cancel_time = datetime.fromtimestamp(self.cycle_end_time - ORDER_CANCEL_BEFORE_END)
+    #     logger.info(
+    #         f"Cancelling resting buy orders at {cancel_time} "
+    #         f"(3.5 min before cycle end {datetime.fromtimestamp(self.cycle_end_time)})"
+    #     )
 
-        for order_id in list(self._active_buy_order_ids):
-            order = self.orders.get(order_id)
-            if order is None:
-                continue
-            if order.status in ('filled', 'MATCHED', 'cancelled'):
-                continue  # already done
+    #     for order_id in list(self._active_buy_order_ids):
+    #         order = self.orders.get(order_id)
+    #         if order is None:
+    #             continue
+    #         if order.status in ('filled', 'MATCHED', 'cancelled'):
+    #             continue  # already done
 
-            if self.dry_run:
-                logger.info(f"[DRY RUN] Would cancel buy order {order_id} @ {order.price}")
-                order.status = "cancelled"
-            else:
-                try:
-                    await self.bot.cancel_order(order_id)
-                    logger.info(f"Cancelled buy order {order_id} @ {order.price}")
-                    order.status = "cancelled"
-                except Exception as e:
-                    logger.warning(f"Failed to cancel order {order_id}: {e}")
+    #         if self.dry_run:
+    #             logger.info(f"[DRY RUN] Would cancel buy order {order_id} @ {order.price}")
+    #             order.status = "cancelled"
+    #         else:
+    #             try:
+    #                 await self.bot.cancel_order(order_id)
+    #                 logger.info(f"Cancelled buy order {order_id} @ {order.price}")
+    #                 order.status = "cancelled"
+    #             except Exception as e:
+    #                 logger.warning(f"Failed to cancel order {order_id}: {e}")
 
     # ------------------------------------------------------------------
     # Market entry
