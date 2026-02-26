@@ -750,23 +750,31 @@ class BaseLowballStrategy(BaseStrategy):
 
 
         total_sell_size = math.floor(order.size_matched * 100) / 100.0
-        
+
         chunk_size_raw = order.size_matched / len(self.sell_targets)
         chunk_size = math.floor(chunk_size_raw * 100) / 100.0
 
 
+        if total_sell_size < 5:
+            logger.info(f"Total sell size {total_sell_size:.2f} is less than 5, skipping all SELL orders")
+        else:
+            sell_order_sizes = [chunk_size] * len(self.sell_targets)
 
-        tasks = [asyncio.create_task(self.place_sell_target(sp, chunk_size, order, total_sell_size, buy_price)) for sp in self.sell_targets]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            while sell_order_sizes[-1] < 5:
+                sell_order_sizes[-2] += sell_order_sizes[-1]
+                sell_order_sizes.pop()
 
-        # Track the position
-        self.add_position(Position(
-            token_id=order.token_id,
-            side='BUY',
-            size=total_sell_size,
-            entry_price=buy_price,
-        ))
+            tasks = [asyncio.create_task(self.place_sell_target(sp, chunk_size, order, total_sell_size, buy_price)) for sp, chunk_size in zip(self.sell_targets, sell_order_sizes)]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Track the position
+            self.add_position(Position(
+                token_id=order.token_id,
+                side='BUY',
+                size=total_sell_size,
+                entry_price=buy_price,
+            ))
 
     async def place_sell_target(self, sell_price: float, chunk_size: float, order: OrderInfo, total_sell_size: float, buy_price: float):
         logger.info(
