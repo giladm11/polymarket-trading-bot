@@ -762,6 +762,7 @@ class BaseLowballStrategy(BaseStrategy):
 
             while sell_order_sizes[-1] < 5:
                 sell_order_sizes[-2] += sell_order_sizes[-1]
+                sell_order_sizes[-2] = math.floor(sell_order_sizes[-2] * 100) / 100.0
                 sell_order_sizes.pop()
 
             tasks = [asyncio.create_task(self.place_sell_target(sp, chunk_size, order, total_sell_size, buy_price)) for sp, chunk_size in zip(self.sell_targets, sell_order_sizes)]
