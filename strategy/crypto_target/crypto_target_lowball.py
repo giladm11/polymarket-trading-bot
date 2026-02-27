@@ -59,6 +59,8 @@ from examples.strategy_example import BaseStrategy, Position, OrderInfo, Strateg
 MARKET_DURATION = 5   # minutes per cycle
 SELL_DELAY_SECONDS = 5
 SELL_ORDER_RETRY_ATTEMPTS = 7
+START_ORDERS_SECONDS_BEFORE_CLOSE = 60
+STOP_ORDERS_SECONDS_BEFORE_CLOSE = 20
 
 # Default thresholds: how close (in USD) the current price must be to the
 # target price to trigger an order.
@@ -904,7 +906,10 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         if self.cycle_active and self._target_price > 0:
             current_price = self._rtds_feed.get_price()
             secs_left = max(0.0, self.cycle_end_time - now)
-            in_window = (now >= self.cycle_end_time - 60 and now < self.cycle_end_time - 20)
+            in_window = (
+                now >= self.cycle_end_time - START_ORDERS_SECONDS_BEFORE_CLOSE 
+                and now < self.cycle_end_time - STOP_ORDERS_SECONDS_BEFORE_CLOSE
+            )
 
             # Collect Polymarket token prices from CLOB WS
             window_tag = f"IN WINDOW ({secs_left:.0f}s left)" if in_window else f"waiting ({secs_left:.0f}s left)"
@@ -973,10 +978,10 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         # (we need to be in before the trigger window starts at 60s)
         now = time.time()
         secs_remaining = cycle_end - now
-        if secs_remaining < 80:
+        if secs_remaining < START_ORDERS_SECONDS_BEFORE_CLOSE + 20:
             logger.info(
                 f"Skipping market {market.get('slug')} — only {secs_remaining:.0f}s left "
-                f"(need >= 80s to enter before trigger window)"
+                f"(need >= {START_ORDERS_SECONDS_BEFORE_CLOSE + 20}s to enter before trigger window)"
             )
             self.entered_cycles.add(cycle_end)  # don't retry this one
             return
@@ -1112,9 +1117,8 @@ class CryptoTargetLowballStrategy(BaseStrategy):
 
         async def place(side_name: str, token_id: str):
             # API GTD security rule: submitted expiration = desired_expiry + 60s.
-            # We want orders to physically cancel at (cycle_end - 20s), so:
-            #   buy_expiry = (cycle_end - 20) + 60 = cycle_end + 40
-            buy_expiry = int(self.cycle_end_time) + 40
+            # We want orders to physically cancel at (cycle_end - STOP_ORDERS_SECONDS_BEFORE_CLOSE), so:
+            buy_expiry = int(self.cycle_end_time) - STOP_ORDERS_SECONDS_BEFORE_CLOSE + 60
             for i, lvl in enumerate(self.price_levels):
                 bp = lvl["buy"]
                 sp = lvl["sell"]
@@ -1146,7 +1150,8 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         p_str = f"${current_price:,.4f}" if current_price is not None else "n/a"
 
         # Look up which sell price was planned for this specific order
-        sell_price = self._order_sell_price.get(order.order_id, self.sell_price)
+        fallback_sell = self.price_levels[0]["sell"] if self.price_levels else 0.70
+        sell_price = self._order_sell_price.get(order.order_id, fallback_sell)
 
         await self._notify(
             f"🟡 <b>BUY FILLED at {now_str}</b>\n"
@@ -1268,7 +1273,7 @@ def run_strategy(ticker: str):
     )
     logger.info(f"Price levels ({len(strategy.price_levels)}): {levels_str} | Threshold: ${strategy.threshold}")
     logger.info(
-        f"Trigger window: last 60s → 20s before cycle end | "
+        f"Trigger window: last 60s → {STOP_ORDERS_SECONDS_BEFORE_CLOSE}s before cycle end | "
         f"Price feed: Chainlink via Polymarket RTDS ({strategy._chainlink_symbol.upper()}) "
         f"+ Polymarket CLOB WS for token events"
     )
