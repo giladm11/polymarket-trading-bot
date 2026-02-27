@@ -60,7 +60,7 @@ MARKET_DURATION = 5            # minutes per cycle
 # NOTE: Gamma's endDate is systematically ~60s ahead of the real market close,
 # so we subtract 60s from the intended 3.5 min (210s) window to compensate:
 #   150s here  +  60s API offset  =  210s = 3.5 min before actual cycle end.
-ORDER_CANCEL_BEFORE_END = 210  # 210s - 60s offset compensation
+ORDER_CANCEL_BEFORE_END = 180  # 210s - 60s offset compensation
 
 SELL_DELAY_SECONDS = 3         # wait after fill before placing sell
 SELL_ORDER_RETRY_ATTEMPTS = 7

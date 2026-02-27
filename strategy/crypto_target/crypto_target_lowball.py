@@ -57,7 +57,7 @@ from examples.strategy_example import BaseStrategy, Position, OrderInfo, Strateg
 # ---------------------------------------------------------------------------
 
 MARKET_DURATION = 5   # minutes per cycle
-SELL_DELAY_SECONDS = 5
+SELL_DELAY_SECONDS = 0
 SELL_ORDER_RETRY_ATTEMPTS = 7
 START_ORDERS_SECONDS_BEFORE_CLOSE = 60
 STOP_ORDERS_SECONDS_BEFORE_CLOSE = 20
@@ -170,12 +170,17 @@ class PolymarketRTDSFeed:
         self._task: Optional[asyncio.Task] = None
         # Optional callback: called with (price: float) on every new price tick
         self._on_price_update = None
-        # Full price history: list of (timestamp_seconds, price)
         self._history: List[tuple] = []
+        self._on_health_change = None
+        self._health_alert_sent = False
 
     def set_on_price_update(self, callback) -> None:
         """Register a callback invoked with the new price on every RTDS update."""
         self._on_price_update = callback
+
+    def set_on_health_change(self, callback) -> None:
+        """Register a callback invoked with (is_healthy: bool) on disconnects and reconnects."""
+        self._on_health_change = callback
 
     def get_price(self) -> Optional[float]:
         """Return the latest Chainlink price, or None if not yet received."""
@@ -198,41 +203,64 @@ class PolymarketRTDSFeed:
             )
         return closest[1]
 
-    async def connect(self, max_retries: int = 10) -> bool:
+    async def connect(self, max_retries: int = -1) -> bool:
         """Connect to RTDS and start streaming Chainlink prices.
 
-        Retries up to max_retries times on failure (e.g. 425 Too Early),
-        waiting 5 seconds between each attempt.
+        Runs a persistent background task that automatically reconnects
+        with exponential backoff if the connection is dropped or rejected.
         """
-        import websockets
+        self._running = True
+        self._task = asyncio.create_task(self._connection_manager())
+        # Wait briefly to let the initial connection attempt run
+        await asyncio.sleep(1)
+        return True
 
-        for attempt in range(1, max_retries + 1):
+    async def _connection_manager(self) -> None:
+        import websockets
+        
+        attempt = 0
+        was_connected = False
+
+        while self._running:
+            attempt += 1
             try:
                 self._ws = await asyncio.wait_for(
                     websockets.connect(POLY_RTDS_WS_URL), timeout=10.0
                 )
-                self._running = True
-                # Subscribe to the full topic — no server-side filter needed.
-                # The server responds with a backfill of recent prices, then
-                # streams live updates. We filter by symbol in _read_loop.
+                
+                # Subscribe to the full topic
                 sub_msg = json.dumps({
                     "action": "subscribe",
                     "subscriptions": [{"topic": "crypto_prices_chainlink", "type": "*"}]
                 })
-
-                logger.info(
-                    f"[RTDS] Connecting for {self._symbol.upper()} — sending: {sub_msg}"
-                )
                 await self._ws.send(sub_msg)
-                self._task = asyncio.create_task(self._read_loop())
+                
                 logger.info(
-                    f"Polymarket RTDS connected — listening for {self._symbol.upper()} prices"
+                    f"[RTDS] Connected for {self._symbol.upper()} — listening for prices"
                 )
-                return True
+                
+                if was_connected is False and attempt > 1:
+                    logger.info(f"Polymarket RTDS reconnected after {attempt-1} failed attempts.")
+                
+                # If we previously sent a down alert, send an up alert
+                if self._health_alert_sent:
+                    self._health_alert_sent = False
+                    if self._on_health_change:
+                        try:
+                            res = self._on_health_change(True)
+                            if asyncio.iscoroutine(res):
+                                asyncio.create_task(res)
+                        except Exception as cb_err:
+                            logger.debug(f"Health callback error: {cb_err}")
+
+                attempt = 0  # reset on successful connect
+                was_connected = True
+
+                # Block here reading messages until disconnected
+                await self._read_loop()
 
             except Exception as e:
-                self._running = False
-                # Clean up the socket if it was opened
+                # Disconnected or failed to connect
                 if self._ws:
                     try:
                         await self._ws.close()
@@ -240,18 +268,31 @@ class PolymarketRTDSFeed:
                         pass
                     self._ws = None
 
-                if attempt < max_retries:
-                    logger.warning(
-                        f"Polymarket RTDS connect failed (attempt {attempt}/{max_retries}): {e} "
-                        f"— retrying in 5s..."
-                    )
-                    await asyncio.sleep(5)
-                else:
-                    logger.error(
-                        f"Polymarket RTDS connect failed after {max_retries} attempts: {e}"
-                    )
-
-        return False
+                if not self._running:
+                    break
+                
+                if was_connected:
+                    was_connected = False
+                    logger.warning(f"Polymarket RTDS disconnected: {e}. Reconnecting...")
+                
+                # If we've failed 3 times, and haven't alerted yet, send alert
+                if attempt >= 3 and not self._health_alert_sent:
+                    self._health_alert_sent = True
+                    if self._on_health_change:
+                        try:
+                            res = self._on_health_change(False)
+                            if asyncio.iscoroutine(res):
+                                asyncio.create_task(res)
+                        except Exception as cb_err:
+                            logger.debug(f"Health callback error: {cb_err}")
+                
+                # Backoff: 1s, 2s, 4s... capped at 10s
+                wait_time = min(10.0, 2.0 ** (attempt - 1))
+                logger.warning(
+                    f"Polymarket RTDS connect failed (attempt {attempt}): {e} "
+                    f"— retrying in {wait_time:.1f}s..."
+                )
+                await asyncio.sleep(wait_time)
 
     async def _read_loop(self) -> None:
         try:
@@ -836,6 +877,14 @@ class CryptoTargetLowballStrategy(BaseStrategy):
                 )
         self._rtds_feed.set_on_price_update(_on_chainlink_price)
 
+        # Register health callback: alert telegram if RTDS fails repeatedly
+        async def _on_health(is_up: bool) -> None:
+            if is_up:
+                await self._notify("🟢 <b>RTDS Reconnected:</b> Data stream is back online.")
+            else:
+                await self._notify("🔴 <b>RTDS Disconnected:</b> Data stream has failed 3+ times. Retrying in background...")
+        self._rtds_feed.set_on_health_change(_on_health)
+
         dry = " [DRY RUN]" if self.dry_run else ""
         await self._report_balance(f"{self.name} started{dry}")
 
@@ -1105,7 +1154,8 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         levels_str = "  ".join(
             f"buy={l['buy']:.2f}→sell={l['sell']:.2f}" for l in self.price_levels
         )
-        await self._notify(
+        # Background the notification so it doesn't delay order placement by even a ms
+        asyncio.create_task(self._notify(
             f"🎯 <b>TARGET MATCHED — PLACING ORDERS</b>\n"
             f"Asset: <b>{self.ticker}</b>\n"
             f"Current Price: <b>${current_price:,.4f}</b>\n"
@@ -1113,13 +1163,14 @@ class CryptoTargetLowballStrategy(BaseStrategy):
             f"Diff: <b>${abs(current_price - self._target_price):.4f}</b> "
             f"(threshold ${self.threshold})\n"
             f"Levels: {levels_str}"
-        )
+        ))
 
         async def place(side_name: str, token_id: str):
             # API GTD security rule: submitted expiration = desired_expiry + 60s.
             # We want orders to physically cancel at (cycle_end - STOP_ORDERS_SECONDS_BEFORE_CLOSE), so:
             buy_expiry = int(self.cycle_end_time) - STOP_ORDERS_SECONDS_BEFORE_CLOSE + 60
-            for i, lvl in enumerate(self.price_levels):
+
+            async def place_single(i: int, lvl: dict):
                 bp = lvl["buy"]
                 sp = lvl["sell"]
                 size = round(self.order_amount_usd / bp, 2)
@@ -1134,6 +1185,11 @@ class CryptoTargetLowballStrategy(BaseStrategy):
                 if order:
                     self._order_buy_price[order.order_id] = bp
                     self._order_sell_price[order.order_id] = sp
+            
+            # Run all price levels for this side concurrently
+            tasks = [place_single(i, lvl) for i, lvl in enumerate(self.price_levels)]
+            if tasks:
+                await asyncio.gather(*tasks)
 
         await asyncio.gather(
             place("UP", self.token_ids["up"]),
@@ -1153,16 +1209,17 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         fallback_sell = self.price_levels[0]["sell"] if self.price_levels else 0.70
         sell_price = self._order_sell_price.get(order.order_id, fallback_sell)
 
-        await self._notify(
+        asyncio.create_task(self._notify(
             f"🟡 <b>BUY FILLED at {now_str}</b>\n"
             f"Token: {order.token_id[:20]}...\n"
             f"Buy price: <b>{order.price}</b>\n"
             f"Sell target: <b>{sell_price}</b>\n"
             f"Size: {order.size:.2f} shares\n"
             f"Current {self.ticker}: <b>{p_str}</b>"
-        )
+        ))
 
-        await asyncio.sleep(SELL_DELAY_SECONDS)
+        if SELL_DELAY_SECONDS > 0:
+            await asyncio.sleep(SELL_DELAY_SECONDS)
 
         sell_size = math.floor(order.size_matched * 100) / 100.0
 
@@ -1208,11 +1265,11 @@ class CryptoTargetLowballStrategy(BaseStrategy):
                 f"Failed to place sell order for token {order.token_id} "
                 f"after {SELL_ORDER_RETRY_ATTEMPTS} attempts"
             )
-            await self._notify(
+            asyncio.create_task(self._notify(
                 f"⚠️ <b>SELL FAILED:</b> Could not place auto-sell for "
                 f"{order.token_id[:16]}... at {sell_price} "
                 f"after {SELL_ORDER_RETRY_ATTEMPTS} retries."
-            )
+            ))
 
     async def on_order_update(self, order: OrderInfo) -> None:
         if order.status not in ('filled', 'MATCHED'):
@@ -1237,13 +1294,13 @@ class CryptoTargetLowballStrategy(BaseStrategy):
             )
 
             balance = await self.bot.get_balance()
-            await self._notify(
+            asyncio.create_task(self._notify(
                 f"🟢 <b>SELL FILLED — Profit secured!</b>\n"
                 f"Sell price: <b>{sell_price}</b>\n"
                 f"Size: {order.size:.2f} shares\n"
                 f"Est. profit: <b>${profit_est:.4f}</b>\n"
                 f"Balance: <b>${balance:.2f} USDC</b>"
-            )
+            ))
             self.close_position(order.token_id, 'BUY')
 
 
