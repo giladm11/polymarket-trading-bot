@@ -887,12 +887,9 @@ class CryptoTargetLowballStrategy(BaseStrategy):
 
         current_price = self._rtds_feed.get_price()
         p_str = f"${current_price:,.4f}" if current_price is not None else "(waiting for RTDS...)"
-        await self._notify(
-            f"\U0001f4cb <b>New cycle started</b>\n"
-            f"Market: <b>{slug}</b>\n"
-            f"Question: {question}\n"
-            f"Target (open): <b>{p_str}</b>\n"
-            f"Threshold: <b>${self.threshold}</b>\n"
+        logger.info(
+            f"New cycle started | Market: {slug} | Question: {question} | "
+            f"Target (open): {p_str} | Threshold: ${self.threshold} | "
             f"Ends: {datetime.fromtimestamp(cycle_end).strftime('%H:%M:%S UTC')} "
             f"({secs_remaining:.0f}s remaining)"
         )
