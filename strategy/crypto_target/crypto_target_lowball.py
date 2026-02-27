@@ -63,7 +63,7 @@ SELL_ORDER_RETRY_ATTEMPTS = 7
 # Default thresholds: how close (in USD) the current price must be to the
 # target price to trigger an order.
 DEFAULT_THRESHOLDS: Dict[str, float] = {
-    "BTC": 20.0,
+    "BTC": 100.0,
     "ETH": 1.0,
     "SOL": 0.5,
     "XRP": 0.05,
@@ -291,7 +291,7 @@ class PolymarketRTDSFeed:
                                 if value is not None:
                                     self._price = float(value)
                                     self._last_update = time.time()
-                                    logger.info(
+                                    logger.debug(
                                         f"[RTDS-CL] {self._symbol.upper()} initial price = "
                                         f"${self._price:,.4f} "
                                         f"(from subscribe backfill, {len(price_data)} ticks)"
@@ -313,7 +313,7 @@ class PolymarketRTDSFeed:
                                     # Append to history for future get_price_at() lookups
                                     ts_s = data.get("timestamp", time.time() * 1000) / 1000.0
                                     self._history.append((ts_s, self._price))
-                                    logger.info(
+                                    logger.debug(
                                         f"[RTDS-CL] {self._symbol.upper()} = "
                                         f"${self._price:,.4f}"
                                     )
@@ -477,7 +477,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
 
     def _load_price_levels(self) -> List[Dict[str, float]]:
         """Load price levels from config, falling back to sensible defaults."""
-        default = [{"buy": 0.10, "sell": 0.70}, {"buy": 0.05, "sell": 0.20}]
+        default = [{"buy": 0.10, "sell": 0.70}, {"buy": 0.01, "sell": 0.20}]
         try:
             if self.config_file.exists():
                 data = json.loads(self.config_file.read_text(encoding="utf-8"))
@@ -912,7 +912,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
             if current_price is not None:
                 diff = abs(current_price - self._target_price)
                 threshold_tag = "\u2705 WITHIN" if diff <= self.threshold else "\u274c outside"
-                logger.info(
+                logger.debug(
                     f"[TICK] {self.ticker}  "
                     f"Chainlink=${current_price:,.4f}  "
                     f"target=${self._target_price:,.2f}  "
@@ -921,7 +921,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
                     f"{threshold_tag}  | {window_tag}"
                 )
             else:
-                logger.info(
+                logger.debug(
                     f"[TICK] {self.ticker}  "
                     f"Chainlink=n/a (RTDS connecting...)  "
                     f"target=${self._target_price:,.2f}  "
@@ -987,15 +987,18 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         self.current_market = market
         self.token_ids = self.gamma.parse_token_ids(market)
         self._orders_placed_this_cycle = False
-        self._target_price = 0.0  # will be set below
+        self._target_price = 0.0  # will be set by _fetch_price_to_beat
 
         slug = market.get("slug", "")
         question = market.get("question", "")
 
-        # Parse the market's start time — the target price is the Chainlink price
-        # at the CLOSE of the previous candle = the OPEN of this 5-min window.
-        start_date_iso = market.get("eventStartDate", "") or market.get("startDate", "")
-        cycle_start: Optional[float] = None
+        # Parse cycle_start from the market's eventStartTime field
+        start_date_iso = (
+            market.get("eventStartTime", "")
+            or market.get("eventStartDate", "")
+            or market.get("startDate", "")
+        )
+        cycle_start: float = cycle_end - 300  # default: derive from end
         if start_date_iso:
             try:
                 if start_date_iso.endswith("Z"):
@@ -1003,52 +1006,87 @@ class CryptoTargetLowballStrategy(BaseStrategy):
                 cycle_start = datetime.fromisoformat(start_date_iso).timestamp()
             except Exception:
                 pass
-        if cycle_start is None:
-            # Derive from end time assuming 5-minute windows
-            cycle_start = cycle_end - 300
 
-        # Look up the Chainlink price at cycle_start from RTDS history (backfill)
-        target_from_history = self._rtds_feed.get_price_at(cycle_start)
-        if target_from_history is not None:
-            self._target_price = target_from_history
-            logger.info(
-                f"New market: {slug} | "
-                f"Target (candle open @ {datetime.fromtimestamp(cycle_start).strftime('%H:%M:%S')}): "
-                f"${self._target_price:,.4f} | "
-                f"Ends: {datetime.fromtimestamp(cycle_end).strftime('%H:%M:%S')} ({secs_remaining:.0f}s)"
-            )
-        else:
-            # RTDS backfill not yet received — capture first available price
-            logger.warning(
-                f"New market: {slug} — RTDS history not yet available, "
-                f"will capture target on first tick"
-            )
-            asyncio.create_task(self._capture_target_price(slug))
+        # Fetch the official priceToBeat from the Polymarket events API.
+        # This is only populated once the market window has started.
+        asyncio.create_task(self._fetch_price_to_beat(slug, cycle_start))
 
-        p_str = f"${self._target_price:,.4f}" if self._target_price > 0 else "(waiting for RTDS...)"
         logger.info(
-            f"New cycle started | Market: {slug} | Question: {question} | "
-            f"Target (candle open): {p_str} | Threshold: ${self.threshold} | "
+            f"New cycle started | {slug} | Target: fetching priceToBeat... | "
+            f"Threshold: ${self.threshold} | "
             f"Ends: {datetime.fromtimestamp(cycle_end).strftime('%H:%M:%S UTC')} "
             f"({secs_remaining:.0f}s remaining)"
         )
 
-    async def _capture_target_price(self, slug: str) -> None:
-        """Background task: wait for first RTDS price and set it as the target."""
-        for _ in range(30):  # try for up to 30 seconds
-            if not self.cycle_active or self._target_price > 0:
-                return
-            price = self._rtds_feed.get_price()
-            if price is not None:
-                self._target_price = price
-                logger.info(
-                    f"[{slug}] Target price captured from RTDS: ${self._target_price:,.4f}"
-                )
-                return
-            await asyncio.sleep(1)
-        msg = f"[{slug}] Could not capture target price — RTDS did not deliver within 30s"
+    async def _fetch_price_to_beat(self, slug: str, cycle_start: float) -> None:
+        """Fetch the candle open price from Polymarket's crypto-price API.
+
+        URL: https://polymarket.com/api/crypto/crypto-price
+             ?symbol=BTC&eventStartTime=...Z&variant=fiveminute&endDate=...Z
+        Response field: openPrice  (null while candle is still being built)
+        Retries every 4s until available or cycle ends.
+        """
+        import urllib.request as _urllib
+        from urllib.parse import urlencode
+
+        # Wait until the market has actually started (openPrice only appears then)
+        now = time.time()
+        if now < cycle_start:
+            wait_secs = cycle_start - now
+            logger.info(
+                f"[{slug}] Market starts in {wait_secs:.0f}s — "
+                f"will fetch openPrice at {datetime.fromtimestamp(cycle_start).strftime('%H:%M:%S')}"
+            )
+            await asyncio.sleep(wait_secs)
+
+        # Build URL — timestamps in UTC ISO format with Z suffix
+        start_dt = datetime.fromtimestamp(cycle_start, tz=timezone.utc)
+        end_dt   = datetime.fromtimestamp(self.cycle_end_time, tz=timezone.utc)
+        params = urlencode({
+            "symbol":         self.ticker,
+            "eventStartTime": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "variant":        "fiveminute",
+            "endDate":        end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        url = f"https://polymarket.com/api/crypto/crypto-price?{params}"
+        logger.debug(f"[{slug}] Fetching open price: {url}")
+
+        for attempt in range(30):  # poll up to 2 minutes (30 × 4s)
+            if not self.cycle_active:
+                return  # cycle ended before we got the price
+
+            try:
+                def do_fetch():
+                    req = _urllib.Request(url, headers={"User-Agent": "polymarket-bot/1.0"})
+                    resp = _urllib.urlopen(req, timeout=8)
+                    return json.loads(resp.read().decode())
+
+                data = await asyncio.to_thread(do_fetch)
+                logger.debug(f"[{slug}] crypto-price API response: {data}")
+
+                open_price = data.get("openPrice") if isinstance(data, dict) else None
+                if open_price is not None:
+                    self._target_price = float(open_price)
+                    logger.info(
+                        f"[{slug}] openPrice (target) = ${self._target_price:,.4f} "
+                        f"(attempt {attempt + 1})"
+                    )
+                    return
+                else:
+                    logger.debug(
+                        f"[{slug}] openPrice not yet available "
+                        f"(attempt {attempt + 1}) — retrying in 4s"
+                    )
+
+            except Exception as e:
+                logger.warning(f"[{slug}] crypto-price API error (attempt {attempt + 1}): {e} — retrying in 4s")
+
+            await asyncio.sleep(4)
+
+        msg = f"[{slug}] openPrice not available after 30 attempts — no target price set"
         logger.warning(msg)
         await self._notify(f"⚠️ {msg}")
+
 
     # ------------------------------------------------------------------
     # Order placement on trigger
@@ -1073,8 +1111,10 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         )
 
         async def place(side_name: str, token_id: str):
-            # BUY orders expire 20 seconds before the market closes
-            buy_expiry = int(self.cycle_end_time) - 20
+            # API GTD security rule: submitted expiration = desired_expiry + 60s.
+            # We want orders to physically cancel at (cycle_end - 20s), so:
+            #   buy_expiry = (cycle_end - 20) + 60 = cycle_end + 40
+            buy_expiry = int(self.cycle_end_time) + 40
             for i, lvl in enumerate(self.price_levels):
                 bp = lvl["buy"]
                 sp = lvl["sell"]
@@ -1085,7 +1125,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
                 )
                 order = await self.place_order(
                     token_id=token_id, price=bp, size=size, side="BUY",
-                    expiration=buy_expiry,
+                    order_type="GTD", expiration=buy_expiry,
                 )
                 if order:
                     self._order_buy_price[order.order_id] = bp
