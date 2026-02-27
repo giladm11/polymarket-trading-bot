@@ -520,7 +520,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
 
     def _load_price_levels(self) -> List[Dict[str, float]]:
         """Load price levels from config, falling back to sensible defaults."""
-        default = [{"buy": 0.10, "sell": 0.70}, {"buy": 0.01, "sell": 0.20}]
+        default = [{"buy": 0.10, "sell": 0.70}, {"buy": 0.05, "sell": 0.20}]
         try:
             if self.config_file.exists():
                 data = json.loads(self.config_file.read_text(encoding="utf-8"))
