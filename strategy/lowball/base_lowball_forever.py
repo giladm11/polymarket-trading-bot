@@ -742,7 +742,7 @@ class BaseLowballStrategy(BaseStrategy):
             f"Token: {order.token_id[:20]}...\n"
             f"Buy price: <b>{buy_price}</b>\n"
             f"Sell targets: <b>{targets_str}</b>\n"
-            f"Size: {order.size:.2f} shares"
+            f"Size: {order.size_matched:.2f} shares"
         )
 
         # Wait before placing sell order (non-blocking sleep)
