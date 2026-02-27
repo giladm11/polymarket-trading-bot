@@ -1013,7 +1013,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
             self._target_price = target_from_history
             logger.info(
                 f"New market: {slug} | "
-                f"Target (prev candle close @ {datetime.fromtimestamp(cycle_start).strftime('%H:%M:%S')}): "
+                f"Target (candle open @ {datetime.fromtimestamp(cycle_start).strftime('%H:%M:%S')}): "
                 f"${self._target_price:,.4f} | "
                 f"Ends: {datetime.fromtimestamp(cycle_end).strftime('%H:%M:%S')} ({secs_remaining:.0f}s)"
             )
@@ -1028,7 +1028,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         p_str = f"${self._target_price:,.4f}" if self._target_price > 0 else "(waiting for RTDS...)"
         logger.info(
             f"New cycle started | Market: {slug} | Question: {question} | "
-            f"Target (prev candle close): {p_str} | Threshold: ${self.threshold} | "
+            f"Target (candle open): {p_str} | Threshold: ${self.threshold} | "
             f"Ends: {datetime.fromtimestamp(cycle_end).strftime('%H:%M:%S UTC')} "
             f"({secs_remaining:.0f}s remaining)"
         )
