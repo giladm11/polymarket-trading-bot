@@ -168,6 +168,8 @@ class PolymarketRTDSFeed:
         self._task: Optional[asyncio.Task] = None
         # Optional callback: called with (price: float) on every new price tick
         self._on_price_update = None
+        # Full price history: list of (timestamp_seconds, price)
+        self._history: List[tuple] = []
 
     def set_on_price_update(self, callback) -> None:
         """Register a callback invoked with the new price on every RTDS update."""
@@ -176,6 +178,23 @@ class PolymarketRTDSFeed:
     def get_price(self) -> Optional[float]:
         """Return the latest Chainlink price, or None if not yet received."""
         return self._price
+
+    def get_price_at(self, ts: float) -> Optional[float]:
+        """Return the Chainlink price closest to the given Unix timestamp.
+
+        Uses the stored history from the subscribe backfill + live updates.
+        Returns None if no history is available.
+        """
+        if not self._history:
+            return None
+        # Find the entry with the smallest time difference
+        closest = min(self._history, key=lambda x: abs(x[0] - ts))
+        gap = abs(closest[0] - ts)
+        if gap > 600:  # more than 10 minutes away — not reliable
+            logger.warning(
+                f"[RTDS] get_price_at({ts:.0f}): closest entry is {gap:.0f}s away"
+            )
+        return closest[1]
 
     async def connect(self, max_retries: int = 10) -> bool:
         """Connect to RTDS and start streaming Chainlink prices.
@@ -260,6 +279,13 @@ class PolymarketRTDSFeed:
                             price_data = payload.get("data", [])
                             symbol = payload.get("symbol", "").lower()
                             if price_data and symbol == self._symbol:
+                                # Store full backfill in history (timestamp is ms — convert to seconds)
+                                for entry in price_data:
+                                    ts_s = entry["timestamp"] / 1000.0
+                                    val = entry.get("value")
+                                    if val is not None:
+                                        self._history.append((ts_s, float(val)))
+
                                 latest = price_data[-1]
                                 value = latest.get("value")
                                 if value is not None:
@@ -284,6 +310,9 @@ class PolymarketRTDSFeed:
                                 if value is not None:
                                     self._price = float(value)
                                     self._last_update = time.time()
+                                    # Append to history for future get_price_at() lookups
+                                    ts_s = data.get("timestamp", time.time() * 1000) / 1000.0
+                                    self._history.append((ts_s, self._price))
                                     logger.info(
                                         f"[RTDS-CL] {self._symbol.upper()} = "
                                         f"${self._price:,.4f}"
@@ -963,29 +992,43 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         slug = market.get("slug", "")
         question = market.get("question", "")
 
-        # Capture the Chainlink price RIGHT NOW as the target (open price of this window).
-        # If not yet available (RTDS still connecting), retry in background.
-        snap = self._rtds_feed.get_price()
-        if snap is not None:
-            self._target_price = snap
+        # Parse the market's start time — the target price is the Chainlink price
+        # at the CLOSE of the previous candle = the OPEN of this 5-min window.
+        start_date_iso = market.get("eventStartDate", "") or market.get("startDate", "")
+        cycle_start: Optional[float] = None
+        if start_date_iso:
+            try:
+                if start_date_iso.endswith("Z"):
+                    start_date_iso = start_date_iso[:-1] + "+00:00"
+                cycle_start = datetime.fromisoformat(start_date_iso).timestamp()
+            except Exception:
+                pass
+        if cycle_start is None:
+            # Derive from end time assuming 5-minute windows
+            cycle_start = cycle_end - 300
+
+        # Look up the Chainlink price at cycle_start from RTDS history (backfill)
+        target_from_history = self._rtds_feed.get_price_at(cycle_start)
+        if target_from_history is not None:
+            self._target_price = target_from_history
             logger.info(
                 f"New market: {slug} | "
-                f"Target (Chainlink open): ${self._target_price:,.4f} | "
-                f"Ends: {datetime.fromtimestamp(cycle_end).strftime('%H:%M:%S')} "
-                f"({secs_remaining:.0f}s)"
+                f"Target (prev candle close @ {datetime.fromtimestamp(cycle_start).strftime('%H:%M:%S')}): "
+                f"${self._target_price:,.4f} | "
+                f"Ends: {datetime.fromtimestamp(cycle_end).strftime('%H:%M:%S')} ({secs_remaining:.0f}s)"
             )
         else:
+            # RTDS backfill not yet received — capture first available price
             logger.warning(
-                f"New market: {slug} — RTDS price not yet available, "
-                f"will capture on first tick"
+                f"New market: {slug} — RTDS history not yet available, "
+                f"will capture target on first tick"
             )
             asyncio.create_task(self._capture_target_price(slug))
 
-        current_price = self._rtds_feed.get_price()
-        p_str = f"${current_price:,.4f}" if current_price is not None else "(waiting for RTDS...)"
+        p_str = f"${self._target_price:,.4f}" if self._target_price > 0 else "(waiting for RTDS...)"
         logger.info(
             f"New cycle started | Market: {slug} | Question: {question} | "
-            f"Target (open): {p_str} | Threshold: ${self.threshold} | "
+            f"Target (prev candle close): {p_str} | Threshold: ${self.threshold} | "
             f"Ends: {datetime.fromtimestamp(cycle_end).strftime('%H:%M:%S UTC')} "
             f"({secs_remaining:.0f}s remaining)"
         )
@@ -1030,15 +1073,19 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         )
 
         async def place(side_name: str, token_id: str):
+            # BUY orders expire 20 seconds before the market closes
+            buy_expiry = int(self.cycle_end_time) - 20
             for i, lvl in enumerate(self.price_levels):
                 bp = lvl["buy"]
                 sp = lvl["sell"]
                 size = round(self.order_amount_usd / bp, 2)
                 logger.info(
-                    f"Placing BUY{i+1} {side_name} — {size:.2f} shares @ {bp} (sell target: {sp})"
+                    f"Placing BUY{i+1} {side_name} — {size:.2f} shares @ {bp} "
+                    f"(sell target: {sp}, expires: {datetime.fromtimestamp(buy_expiry).strftime('%H:%M:%S')})"
                 )
                 order = await self.place_order(
                     token_id=token_id, price=bp, size=size, side="BUY",
+                    expiration=buy_expiry,
                 )
                 if order:
                     self._order_buy_price[order.order_id] = bp
