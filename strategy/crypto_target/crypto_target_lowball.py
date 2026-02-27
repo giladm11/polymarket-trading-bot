@@ -6,8 +6,10 @@ Runs continuously on 5-min BTC/ETH/SOL/XRP markets.
 
 Logic:
   - Connects to the Polymarket Market WebSocket to receive live
-    best_bid_ask / last_trade_price events for the current tokens.
-  - Polls CoinGecko for the current real-world price of the asset.
+    last_trade_price events for the current tokens.
+  - Connects to the Polymarket RTDS (wss://ws-live-data.polymarket.com)
+    and subscribes to crypto_prices_chainlink for live BTC/ETH/SOL/XRP
+    prices — the exact same Chainlink feed Polymarket resolves against.
   - Parses the "strike price" (target) from the market question
     (e.g. "Will BTC be above $84,950 at 11:20 PM?").
   - In the LAST MINUTE (60s → 20s before cycle end):
@@ -67,19 +69,19 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
     "XRP": 0.05,
 }
 
-# Polymarket Market WebSocket endpoint
+# Polymarket Market WebSocket — token orderbook events
 POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-# CoinGecko coin IDs
-COINGECKO_IDS: Dict[str, str] = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "SOL": "solana",
-    "XRP": "ripple",
-}
+# Polymarket RTDS — Chainlink crypto price stream (no auth required)
+POLY_RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 
-# How often to refresh the current price from CoinGecko (seconds)
-PRICE_POLL_INTERVAL = 5
+# Chainlink symbol names on the RTDS feed
+CHAINLINK_SYMBOLS: Dict[str, str] = {
+    "BTC": "btc/usd",
+    "ETH": "eth/usd",
+    "SOL": "sol/usd",
+    "XRP": "xrp/usd",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -140,59 +142,68 @@ class TelegramNotifier:
             logger.debug(f"Telegram getUpdates failed: {e}")
             return []
 
-
 # ---------------------------------------------------------------------------
-# Polymarket Market WebSocket feed
+# Polymarket RTDS — Chainlink price feed
 # ---------------------------------------------------------------------------
 
-class PolymarketMarketFeed:
+class PolymarketRTDSFeed:
     """
-    Subscribes to the Polymarket Market WebSocket for a set of token IDs.
+    Connects to the Polymarket Real-Time Data Socket (RTDS) and subscribes
+    to the crypto_prices_chainlink topic for a single symbol.
 
-    Tracks the last_trade_price for each subscribed token.
+    No API key required. Provides the exact Chainlink price that
+    Polymarket uses to resolve its 5-min crypto markets.
+
+    Endpoint : wss://ws-live-data.polymarket.com
+    Symbols  : btc/usd  eth/usd  sol/usd  xrp/usd
     """
 
-    def __init__(self):
+    def __init__(self, symbol: str):
+        """
+        Args:
+            symbol: Chainlink symbol, e.g. "btc/usd"
+        """
+        self._symbol = symbol.lower()
+        self._price: Optional[float] = None
+        self._last_update: float = 0.0
         self._ws = None
         self._running = False
         self._task: Optional[asyncio.Task] = None
-        # token_id → last trade price (float)
-        self._last_trade: Dict[str, Optional[float]] = {}
-        self._subscribed_tokens: List[str] = []
+        # Optional callback: called with (price: float) on every new price tick
+        self._on_price_update = None
 
-    def get_last_trade(self, token_id: str) -> Optional[float]:
-        """Return the most recent trade price for a token, or None if unseen."""
-        return self._last_trade.get(token_id)
+    def set_on_price_update(self, callback) -> None:
+        """Register a callback invoked with the new price on every RTDS update."""
+        self._on_price_update = callback
 
-    async def subscribe(self, token_ids: List[str]) -> bool:
-        """Connect to WS and subscribe to the given token IDs."""
-        self._subscribed_tokens = list(token_ids)
-        for tid in token_ids:
-            self._last_trade.setdefault(tid, None)
+    def get_price(self) -> Optional[float]:
+        """Return the latest Chainlink price, or None if not yet received."""
+        return self._price
 
-        await self.disconnect()  # close any previous connection
-        return await self._connect()
-
-    async def _connect(self) -> bool:
+    async def connect(self) -> bool:
+        """Connect to RTDS and start streaming Chainlink prices."""
         try:
             import websockets
             self._ws = await asyncio.wait_for(
-                websockets.connect(POLY_WS_URL), timeout=10.0
+                websockets.connect(POLY_RTDS_WS_URL), timeout=10.0
             )
             self._running = True
             sub_msg = json.dumps({
-                "assets_ids": self._subscribed_tokens,
-                "type": "market",
+                "action": "subscribe",
+                "subscriptions": [{
+                    "topic": "crypto_prices_chainlink",
+                    "type": "*",
+                    "filters": json.dumps({"symbol": self._symbol}),
+                }]
             })
             await self._ws.send(sub_msg)
             self._task = asyncio.create_task(self._read_loop())
             logger.info(
-                f"Polymarket WS connected & subscribed to "
-                f"{len(self._subscribed_tokens)} token(s)"
+                f"Polymarket RTDS connected — Chainlink {self._symbol.upper()} stream active"
             )
             return True
         except Exception as e:
-            logger.warning(f"Polymarket WS connect failed: {e}")
+            logger.warning(f"Polymarket RTDS connect failed: {e}")
             self._running = False
             return False
 
@@ -201,35 +212,48 @@ class PolymarketMarketFeed:
             async for raw_msg in self._ws:
                 if not self._running:
                     break
+                # Heartbeat
+                if raw_msg == "PING":
+                    try:
+                        await self._ws.send("PONG")
+                    except Exception:
+                        pass
+                    continue
                 try:
-                    msgs = json.loads(raw_msg)
-                    if isinstance(msgs, dict):
-                        msgs = [msgs]
-                    for msg in msgs:
-                        self._handle_message(msg)
+                    data = json.loads(raw_msg)
+                    topic = data.get("topic", "")
+                    msg_type = data.get("type", "")
+                    # Log every message received from the RTDS
+                    logger.debug(f"[RTDS] raw topic={topic} type={msg_type}")
+                    if (
+                        topic == "crypto_prices_chainlink"
+                        and msg_type == "update"
+                    ):
+                        payload = data.get("payload", {})
+                        if payload.get("symbol", "").lower() == self._symbol:
+                            value = payload.get("value")
+                            if value is not None:
+                                self._price = float(value)
+                                self._last_update = time.time()
+                                logger.info(
+                                    f"[RTDS-CL] {self._symbol.upper()} = "
+                                    f"${self._price:,.4f}"
+                                )
+                                # Fire the on_price_update callback (logs vs target)
+                                if self._on_price_update:
+                                    try:
+                                        self._on_price_update(self._price)
+                                    except Exception as cb_err:
+                                        logger.debug(f"Price callback error: {cb_err}")
+                    else:
+                        # Log any other message types we receive (ACK, etc.)
+                        logger.debug(f"[RTDS] received: topic={topic!r} type={msg_type!r}")
                 except Exception as e:
-                    logger.debug(f"WS parse error: {e}")
+                    logger.debug(f"RTDS parse error: {e}")
         except Exception as e:
-            logger.debug(f"WS read loop ended: {e}")
+            logger.debug(f"RTDS read loop ended: {e}")
         finally:
             self._running = False
-
-    def _handle_message(self, msg: Dict[str, Any]) -> None:
-        event_type = msg.get("event_type", "")
-
-        if event_type == "last_trade_price":
-            token_id = msg.get("asset_id", "")
-            if token_id not in self._last_trade:
-                return
-            price = msg.get("price")
-            if price is not None:
-                prev = self._last_trade.get(token_id)
-                self._last_trade[token_id] = float(price)
-                logger.info(
-                    f"[WS] last_trade_price  token={token_id[:16]}...  "
-                    f"price={float(price):.4f}"
-                    + (f"  (prev={prev:.4f})" if prev is not None else "  (first trade)")
-                )
 
     async def disconnect(self) -> None:
         self._running = False
@@ -246,71 +270,6 @@ class PolymarketMarketFeed:
             except Exception:
                 pass
             self._ws = None
-
-
-# ---------------------------------------------------------------------------
-# CoinGecko price poller
-# ---------------------------------------------------------------------------
-
-class CoinGeckoFeed:
-    """
-    Polls CoinGecko's free public API every PRICE_POLL_INTERVAL seconds
-    for the current USD price of one or more coins.
-
-    No API key required.
-    """
-
-    BASE_URL = "https://api.coingecko.com/api/v3"
-
-    def __init__(self, coin_ids: List[str]):
-        """
-        Args:
-            coin_ids: List of CoinGecko IDs (e.g. ["bitcoin", "ethereum"])
-        """
-        self._coin_ids = coin_ids
-        self._prices: Dict[str, float] = {}
-        self._running = False
-        self._task: Optional[asyncio.Task] = None
-
-    def get_price(self, coin_id: str) -> Optional[float]:
-        return self._prices.get(coin_id)
-
-    async def start(self) -> None:
-        self._running = True
-        await self._fetch()   # initial fetch before returning
-        self._task = asyncio.create_task(self._poll_loop())
-
-    async def stop(self) -> None:
-        self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-
-    async def _poll_loop(self) -> None:
-        while self._running:
-            await asyncio.sleep(PRICE_POLL_INTERVAL)
-            await self._fetch()
-
-    async def _fetch(self) -> None:
-        import urllib.request
-        ids_str = ",".join(self._coin_ids)
-        url = f"{self.BASE_URL}/simple/price?ids={ids_str}&vs_currencies=usd"
-        try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "polymarket-bot/1.0"}
-            )
-            raw = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
-            data = json.loads(raw.read().decode())
-            for coin_id in self._coin_ids:
-                price = data.get(coin_id, {}).get("usd")
-                if price is not None:
-                    self._prices[coin_id] = float(price)
-                    logger.debug(f"CoinGecko {coin_id} = ${price:.4f}")
-        except Exception as e:
-            logger.warning(f"CoinGecko fetch failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -355,10 +314,10 @@ class CryptoTargetLowballStrategy(BaseStrategy):
     asset price is close to the market's target (strike) price.
 
     Price data comes from:
-      - CoinGecko REST (current BTC/ETH/SOL/XRP spot price)
-      - Polymarket Market WebSocket (token orderbook / trade events)
+      - Polymarket RTDS crypto_prices_chainlink (live Chainlink BTC/ETH/SOL/XRP)
+      - Polymarket Market WebSocket CLOB (token last_trade_price events)
     Target price:
-      - Parsed from the market question string
+      - Parsed from the market question string (e.g. "Will BTC be above $84,950?")
     """
 
     def __init__(self, bot: TradingBot, ticker: str, params: Optional[Dict[str, Any]] = None):
@@ -401,12 +360,10 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         if self.dry_run:
             logger.warning("*** DRY RUN MODE — orders will NOT be submitted ***")
 
-        # Price feeds
-        coin_id = COINGECKO_IDS.get(self.ticker, self.ticker.lower())
-        self._coingecko = CoinGeckoFeed(coin_ids=[coin_id])
-        self._coin_id = coin_id
-
-        self._poly_ws = PolymarketMarketFeed()
+        # Chainlink price feed via Polymarket RTDS
+        chainlink_symbol = CHAINLINK_SYMBOLS.get(self.ticker, f"{self.ticker.lower()}/usd")
+        self._rtds_feed = PolymarketRTDSFeed(symbol=chainlink_symbol)
+        self._chainlink_symbol = chainlink_symbol
 
         # Track which cycles we've already entered
         self.entered_cycles: set = set()
@@ -536,8 +493,8 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         HELP = (
             f"🤖 <b>[{self.name}] Available commands:</b>\n"
             "/balance — current USDC balance\n"
-            "/price — current asset price from CoinGecko\n"
-            "/target — current cycle target price (from market question)\n"
+            "/price — live Chainlink price (via Polymarket RTDS)\n"
+            "/target — current market target price + current diff\n"
             "/size — current order size in USD\n"
             "/setsize &lt;amount&gt; — e.g. /setsize 2\n"
             "/buy — current buy price\n"
@@ -576,23 +533,23 @@ class CryptoTargetLowballStrategy(BaseStrategy):
 
                     # ---- price ----
                     elif command == "/price":
-                        p = self._coingecko.get_price(self._coin_id)
-                        if p:
+                        p = self._rtds_feed.get_price()
+                        if p is not None:
                             reply = (
-                                f"<b>[{self.name}]</b> 📊 {self.ticker} price: "
-                                f"<b>${p:,.4f}</b> (CoinGecko)"
+                                f"<b>[{self.name}]</b> 📊 {self.ticker} Chainlink price: "
+                                f"<b>${p:,.4f}</b> (Polymarket RTDS)"
                             )
                         else:
-                            reply = f"<b>[{self.name}]</b> ⚠️ No price data yet."
+                            reply = f"<b>[{self.name}]</b> ⚠️ No Chainlink price yet — RTDS connecting..."
 
                     # ---- target ----
                     elif command == "/target":
                         if self._target_price > 0:
-                            p = self._coingecko.get_price(self._coin_id)
-                            diff = abs(p - self._target_price) if p else None
+                            p = self._rtds_feed.get_price()
+                            diff = abs(p - self._target_price) if p is not None else None
                             diff_str = f" | Δ = <b>${diff:,.4f}</b> (threshold ${self.threshold})" if diff is not None else ""
                             reply = (
-                                f"<b>[{self.name}]</b> 🎯 Target price: "
+                                f"<b>[{self.name}]</b> 🎯 Target: "
                                 f"<b>${self._target_price:,.2f}</b>{diff_str}"
                             )
                         else:
@@ -735,14 +692,28 @@ class CryptoTargetLowballStrategy(BaseStrategy):
 
     async def initialize(self) -> None:
         await super().initialize()
-        await self._coingecko.start()
-        logger.info(f"CoinGecko price feed started for {self._coin_id}")
+        await self._rtds_feed.connect()
+
+        # Register price callback: every Chainlink push logs vs current target
+        def _on_chainlink_price(price: float) -> None:
+            target = self._target_price
+            if target > 0:
+                diff = abs(price - target)
+                tag = "\u2705 WITHIN" if diff <= self.threshold else "\u274c outside"
+                logger.info(
+                    f"[RTDS-CL] {self._chainlink_symbol.upper()}  "
+                    f"price=${price:,.4f}  "
+                    f"target=${target:,.2f}  "
+                    f"diff=${diff:.4f}  "
+                    f"threshold=${self.threshold}  {tag}"
+                )
+        self._rtds_feed.set_on_price_update(_on_chainlink_price)
+
         dry = " [DRY RUN]" if self.dry_run else ""
         await self._report_balance(f"{self.name} started{dry}")
 
     async def cleanup(self) -> None:
-        await self._coingecko.stop()
-        await self._poly_ws.disconnect()
+        await self._rtds_feed.disconnect()
         dry = " [DRY RUN]" if self.dry_run else ""
         await self._report_balance(f"{self.name} stopped{dry}")
         await super().cleanup()
@@ -800,45 +771,35 @@ class CryptoTargetLowballStrategy(BaseStrategy):
                 if self.orders[order_id].status not in ('filled', 'MATCHED', 'cancelled'):
                     del self.orders[order_id]
             self._order_buy_price.clear()
-            # Disconnect WS — will reconnect on next cycle
-            await self._poly_ws.disconnect()
 
         # ── 2. Try to enter the current active market ─────────────────
         await self._try_enter_market()
 
         # ── 3. Price + decision logging ────────────────────────────────
         if self.cycle_active and self._target_price > 0:
-            current_price = self._coingecko.get_price(self._coin_id)
+            current_price = self._rtds_feed.get_price()
             secs_left = max(0.0, self.cycle_end_time - now)
             in_window = (now >= self.cycle_end_time - 60 and now < self.cycle_end_time - 20)
 
-            # Log token prices from Polymarket WS
-            token_price_parts = []
-            for side_name, token_id in self.token_ids.items():
-                tp = self._poly_ws.get_last_trade(token_id)
-                tp_str = f"{tp:.4f}" if tp is not None else "n/a"
-                token_price_parts.append(f"{side_name.upper()}={tp_str}")
-            token_price_str = "  ".join(token_price_parts) if token_price_parts else "(no WS data yet)"
+            # Collect Polymarket token prices from CLOB WS
+            window_tag = f"IN WINDOW ({secs_left:.0f}s left)" if in_window else f"waiting ({secs_left:.0f}s left)"
 
             if current_price is not None:
                 diff = abs(current_price - self._target_price)
-                window_tag = f"IN WINDOW ({secs_left:.0f}s left)" if in_window else f"waiting ({secs_left:.0f}s left)"
-                threshold_tag = f"✅ WITHIN threshold" if diff <= self.threshold else f"❌ outside threshold"
+                threshold_tag = "\u2705 WITHIN" if diff <= self.threshold else "\u274c outside"
                 logger.info(
                     f"[TICK] {self.ticker}  "
-                    f"CoinGecko=${current_price:,.4f}  "
+                    f"Chainlink=${current_price:,.4f}  "
                     f"target=${self._target_price:,.2f}  "
                     f"diff=${diff:.4f}  "
                     f"threshold=${self.threshold}  "
-                    f"{threshold_tag}  "
-                    f"| Poly tokens: {token_price_str}  "
-                    f"| {window_tag}"
+                    f"{threshold_tag}  | {window_tag}"
                 )
             else:
                 logger.info(
                     f"[TICK] {self.ticker}  "
-                    f"CoinGecko=n/a  target=${self._target_price:,.2f}  "
-                    f"| Poly tokens: {token_price_str}  "
+                    f"Chainlink=n/a (RTDS connecting...)  "
+                    f"target=${self._target_price:,.2f}  "
                     f"| {secs_left:.0f}s left"
                 )
 
@@ -851,7 +812,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
                 diff = abs(current_price - self._target_price)
                 if diff <= self.threshold:
                     logger.info(
-                        f"[TRIGGER] ✅ Conditions met — diff=${diff:.4f} <= ${self.threshold} "
+                        f"[TRIGGER] ✅ diff=${diff:.4f} <= ${self.threshold} "
                         f"— placing BUY orders now!"
                     )
                     self._orders_placed_this_cycle = True
@@ -865,7 +826,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
     async def _try_enter_market(self) -> None:
         """
         Find & track the current active 5-min market.
-        Subscribes the Polymarket WS to its token IDs.
+        The target price is the live Chainlink price at the moment the window opens.
         """
         market = self.gamma.get_current_market(self.ticker)
         if not market or not market.get("acceptingOrders", False):
@@ -883,46 +844,73 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         if cycle_end in self.entered_cycles:
             return
 
+        # Don't enter a market that has less than 80 seconds remaining
+        # (we need to be in before the trigger window starts at 60s)
+        now = time.time()
+        secs_remaining = cycle_end - now
+        if secs_remaining < 80:
+            logger.info(
+                f"Skipping market {market.get('slug')} — only {secs_remaining:.0f}s left "
+                f"(need >= 80s to enter before trigger window)"
+            )
+            self.entered_cycles.add(cycle_end)  # don't retry this one
+            return
+
         self.entered_cycles.add(cycle_end)
         self.cycle_end_time = cycle_end
         self.cycle_active = True
         self.current_market = market
         self.token_ids = self.gamma.parse_token_ids(market)
         self._orders_placed_this_cycle = False
+        self._target_price = 0.0  # will be set below
 
-        # Parse target price from question
+        slug = market.get("slug", "")
         question = market.get("question", "")
-        self._target_price = parse_target_price_from_question(question) or 0.0
-        if self._target_price > 0:
+
+        # Capture the Chainlink price RIGHT NOW as the target (open price of this window).
+        # If not yet available (RTDS still connecting), retry in background.
+        snap = self._rtds_feed.get_price()
+        if snap is not None:
+            self._target_price = snap
             logger.info(
-                f"New market: {market.get('slug')} | "
-                f"Target: ${self._target_price:,.2f} | "
-                f"Ends: {datetime.fromtimestamp(cycle_end)}"
+                f"New market: {slug} | "
+                f"Target (Chainlink open): ${self._target_price:,.4f} | "
+                f"Ends: {datetime.fromtimestamp(cycle_end).strftime('%H:%M:%S')} "
+                f"({secs_remaining:.0f}s)"
             )
         else:
             logger.warning(
-                f"New market: {market.get('slug')} — could not parse target "
-                f"price from question: '{question}'"
+                f"New market: {slug} — RTDS price not yet available, "
+                f"will capture on first tick"
             )
+            asyncio.create_task(self._capture_target_price(slug))
 
-        # Subscribe Polymarket WS to this market's tokens
-        token_list = [v for v in self.token_ids.values() if v]
-        connected = await self._poly_ws.subscribe(token_list)
-        if connected:
-            logger.info(f"Polymarket WS subscribed to {len(token_list)} token(s) for {self.ticker}")
-        else:
-            logger.warning("Polymarket WS subscription failed — will rely on CoinGecko only")
-
-        current_price = self._coingecko.get_price(self._coin_id)
-        p_str = f"${current_price:,.4f}" if current_price else "n/a"
+        current_price = self._rtds_feed.get_price()
+        p_str = f"${current_price:,.4f}" if current_price is not None else "(waiting for RTDS...)"
         await self._notify(
-            f"📋 <b>New cycle started</b>\n"
-            f"Market: <b>{market.get('slug')}</b>\n"
-            f"Target: <b>${self._target_price:,.2f}</b>\n"
-            f"Current {self.ticker}: <b>{p_str}</b>\n"
+            f"\U0001f4cb <b>New cycle started</b>\n"
+            f"Market: <b>{slug}</b>\n"
+            f"Question: {question}\n"
+            f"Target (open): <b>{p_str}</b>\n"
             f"Threshold: <b>${self.threshold}</b>\n"
-            f"Ends: {datetime.fromtimestamp(cycle_end).strftime('%H:%M:%S UTC')}"
+            f"Ends: {datetime.fromtimestamp(cycle_end).strftime('%H:%M:%S UTC')} "
+            f"({secs_remaining:.0f}s remaining)"
         )
+
+    async def _capture_target_price(self, slug: str) -> None:
+        """Background task: wait for first RTDS price and set it as the target."""
+        for _ in range(30):  # try for up to 30 seconds
+            if not self.cycle_active or self._target_price > 0:
+                return
+            price = self._rtds_feed.get_price()
+            if price is not None:
+                self._target_price = price
+                logger.info(
+                    f"[{slug}] Target price captured from RTDS: ${self._target_price:,.4f}"
+                )
+                return
+            await asyncio.sleep(1)
+        logger.warning(f"[{slug}] Could not capture target price — RTDS did not deliver within 30s")
 
     # ------------------------------------------------------------------
     # Order placement on trigger
@@ -1085,9 +1073,9 @@ def run_strategy(ticker: str):
     logger.info(f"Buy @ {strategy.buy_price} | Sell @ {strategy.sell_price} | "
                 f"Threshold: ${strategy.threshold}")
     logger.info(
-        f"Trigger window: last 60s → 20s before cycle end\n"
-        f"Price feed: CoinGecko ({strategy._coin_id}) "
-        f"+ Polymarket WS for market events"
+        f"Trigger window: last 60s → 20s before cycle end | "
+        f"Price feed: Chainlink via Polymarket RTDS ({strategy._chainlink_symbol.upper()}) "
+        f"+ Polymarket CLOB WS for token events"
     )
 
     try:
