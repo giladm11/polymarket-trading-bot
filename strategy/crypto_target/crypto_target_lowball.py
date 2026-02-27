@@ -69,9 +69,6 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
     "XRP": 0.05,
 }
 
-# Polymarket Market WebSocket — token orderbook events
-POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-
 # Polymarket RTDS — Chainlink crypto price stream (no auth required)
 POLY_RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 
@@ -180,32 +177,60 @@ class PolymarketRTDSFeed:
         """Return the latest Chainlink price, or None if not yet received."""
         return self._price
 
-    async def connect(self) -> bool:
-        """Connect to RTDS and start streaming Chainlink prices."""
-        try:
-            import websockets
-            self._ws = await asyncio.wait_for(
-                websockets.connect(POLY_RTDS_WS_URL), timeout=10.0
-            )
-            self._running = True
-            sub_msg = json.dumps({
-                "action": "subscribe",
-                "subscriptions": [{
-                    "topic": "crypto_prices_chainlink",
-                    "type": "*",
-                    "filters": json.dumps({"symbol": self._symbol}),
-                }]
-            })
-            await self._ws.send(sub_msg)
-            self._task = asyncio.create_task(self._read_loop())
-            logger.info(
-                f"Polymarket RTDS connected — Chainlink {self._symbol.upper()} stream active"
-            )
-            return True
-        except Exception as e:
-            logger.warning(f"Polymarket RTDS connect failed: {e}")
-            self._running = False
-            return False
+    async def connect(self, max_retries: int = 10) -> bool:
+        """Connect to RTDS and start streaming Chainlink prices.
+
+        Retries up to max_retries times on failure (e.g. 425 Too Early),
+        waiting 5 seconds between each attempt.
+        """
+        import websockets
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._ws = await asyncio.wait_for(
+                    websockets.connect(POLY_RTDS_WS_URL), timeout=10.0
+                )
+                self._running = True
+                # Subscribe to the full topic — no server-side filter needed.
+                # The server responds with a backfill of recent prices, then
+                # streams live updates. We filter by symbol in _read_loop.
+                sub_msg = json.dumps({
+                    "action": "subscribe",
+                    "subscriptions": [{"topic": "crypto_prices_chainlink", "type": "*"}]
+                })
+
+                logger.info(
+                    f"[RTDS] Connecting for {self._symbol.upper()} — sending: {sub_msg}"
+                )
+                await self._ws.send(sub_msg)
+                self._task = asyncio.create_task(self._read_loop())
+                logger.info(
+                    f"Polymarket RTDS connected — listening for {self._symbol.upper()} prices"
+                )
+                return True
+
+            except Exception as e:
+                self._running = False
+                # Clean up the socket if it was opened
+                if self._ws:
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
+                    self._ws = None
+
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Polymarket RTDS connect failed (attempt {attempt}/{max_retries}): {e} "
+                        f"— retrying in 5s..."
+                    )
+                    await asyncio.sleep(5)
+                else:
+                    logger.error(
+                        f"Polymarket RTDS connect failed after {max_retries} attempts: {e}"
+                    )
+
+        return False
 
     async def _read_loop(self) -> None:
         try:
@@ -223,37 +248,63 @@ class PolymarketRTDSFeed:
                     data = json.loads(raw_msg)
                     topic = data.get("topic", "")
                     msg_type = data.get("type", "")
-                    # Log every message received from the RTDS
+                    payload = data.get("payload", {})
+
                     logger.debug(f"[RTDS] raw topic={topic} type={msg_type}")
-                    if (
-                        topic == "crypto_prices_chainlink"
-                        and msg_type == "update"
-                    ):
-                        payload = data.get("payload", {})
-                        if payload.get("symbol", "").lower() == self._symbol:
-                            value = payload.get("value")
-                            if value is not None:
-                                self._price = float(value)
-                                self._last_update = time.time()
-                                logger.info(
-                                    f"[RTDS-CL] {self._symbol.upper()} = "
-                                    f"${self._price:,.4f}"
-                                )
-                                # Fire the on_price_update callback (logs vs target)
-                                if self._on_price_update:
-                                    try:
-                                        self._on_price_update(self._price)
-                                    except Exception as cb_err:
-                                        logger.debug(f"Price callback error: {cb_err}")
+
+                    # Both 'crypto_prices' and 'crypto_prices_chainlink' carry price data
+                    if topic in ("crypto_prices", "crypto_prices_chainlink"):
+
+                        if msg_type == "subscribe":
+                            # Subscribe confirmation — server sends historical backfill in payload.data[]
+                            price_data = payload.get("data", [])
+                            symbol = payload.get("symbol", "").lower()
+                            if price_data and symbol == self._symbol:
+                                latest = price_data[-1]
+                                value = latest.get("value")
+                                if value is not None:
+                                    self._price = float(value)
+                                    self._last_update = time.time()
+                                    logger.info(
+                                        f"[RTDS-CL] {self._symbol.upper()} initial price = "
+                                        f"${self._price:,.4f} "
+                                        f"(from subscribe backfill, {len(price_data)} ticks)"
+                                    )
+                                    if self._on_price_update:
+                                        try:
+                                            self._on_price_update(self._price)
+                                        except Exception as cb_err:
+                                            logger.debug(f"Price callback error: {cb_err}")
+
+                        elif msg_type == "update":
+                            # Real-time single-price update
+                            symbol = payload.get("symbol", "").lower()
+                            if symbol == self._symbol:
+                                value = payload.get("value")
+                                if value is not None:
+                                    self._price = float(value)
+                                    self._last_update = time.time()
+                                    logger.info(
+                                        f"[RTDS-CL] {self._symbol.upper()} = "
+                                        f"${self._price:,.4f}"
+                                    )
+                                    if self._on_price_update:
+                                        try:
+                                            self._on_price_update(self._price)
+                                        except Exception as cb_err:
+                                            logger.debug(f"Price callback error: {cb_err}")
+                        else:
+                            logger.debug(f"[RTDS] unhandled: topic={topic!r} type={msg_type!r}")
                     else:
-                        # Log any other message types we receive (ACK, etc.)
                         logger.debug(f"[RTDS] received: topic={topic!r} type={msg_type!r}")
+
                 except Exception as e:
                     logger.debug(f"RTDS parse error: {e}")
         except Exception as e:
             logger.debug(f"RTDS read loop ended: {e}")
         finally:
             self._running = False
+
 
     async def disconnect(self) -> None:
         self._running = False
@@ -349,8 +400,9 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         self.order_amount_usd: float = self._load_config_value(
             "order_amount_usd", float(os.environ.get("ORDER_AMOUNT_USD", "1"))
         )
-        self.buy_price: float = self._load_config_value("buy_price", 0.10)
-        self.sell_price: float = self._load_config_value("sell_price", 0.70)
+        # List of {"buy": price, "sell": target} levels — all placed on trigger
+        self.price_levels: List[Dict[str, float]] = self._load_price_levels()
+
         self.threshold: float = self._load_config_value(
             "threshold", DEFAULT_THRESHOLDS.get(self.ticker, 1.0)
         )
@@ -368,8 +420,9 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         # Track which cycles we've already entered
         self.entered_cycles: set = set()
 
-        # Per-order metadata
+        # Per-order metadata: buy price and sell target for each open order
         self._order_buy_price: Dict[str, float] = {}
+        self._order_sell_price: Dict[str, float] = {}
 
         # Balance reporting
         self._last_balance_report: float = 0.0
@@ -393,6 +446,21 @@ class CryptoTargetLowballStrategy(BaseStrategy):
             logger.warning(f"Could not read {self.config_file.name} ({key}): {e}")
         return default
 
+    def _load_price_levels(self) -> List[Dict[str, float]]:
+        """Load price levels from config, falling back to sensible defaults."""
+        default = [{"buy": 0.10, "sell": 0.70}, {"buy": 0.05, "sell": 0.20}]
+        try:
+            if self.config_file.exists():
+                data = json.loads(self.config_file.read_text(encoding="utf-8"))
+                levels = data.get("price_levels")
+                if isinstance(levels, list) and levels:
+                    parsed = [{"buy": float(l["buy"]), "sell": float(l["sell"])} for l in levels]
+                    logger.info(f"Loaded {len(parsed)} price level(s) from config")
+                    return parsed
+        except Exception as e:
+            logger.warning(f"Could not load price_levels from config: {e}")
+        return default
+
     def _save_config(self) -> None:
         try:
             data = {}
@@ -402,8 +470,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
                 except Exception:
                     pass
             data["order_amount_usd"] = self.order_amount_usd
-            data["buy_price"] = self.buy_price
-            data["sell_price"] = self.sell_price
+            data["price_levels"] = self.price_levels
             data["threshold"] = self.threshold
             data["balance_report_interval"] = self.balance_report_interval
             self.config_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -497,12 +564,12 @@ class CryptoTargetLowballStrategy(BaseStrategy):
             "/target — current market target price + current diff\n"
             "/size — current order size in USD\n"
             "/setsize &lt;amount&gt; — e.g. /setsize 2\n"
-            "/buy — current buy price\n"
-            "/setbuy &lt;price&gt; — e.g. /setbuy 0.10\n"
-            "/sell — current sell price\n"
-            "/setsell &lt;price&gt; — e.g. /setsell 0.70\n"
+            "/levels — list all buy/sell price levels\n"
+            "/addlevel &lt;buy&gt; &lt;sell&gt; — e.g. /addlevel 0.03 0.15\n"
+            "/removelevel &lt;index&gt; — e.g. /removelevel 1\n"
+            "/setlevel &lt;index&gt; &lt;buy&gt; &lt;sell&gt; — e.g. /setlevel 0 0.10 0.80\n"
             "/threshold — current price threshold\n"
-            f"/setthreshold &lt;value&gt; — e.g. /setthreshold 20   (default: {DEFAULT_THRESHOLDS.get(self.ticker, 1.0)})\n"
+            f"/setthreshold &lt;value&gt; — e.g. /setthreshold 20  (default: {DEFAULT_THRESHOLDS.get(self.ticker, 1.0)})\n"
             "/interval — balance report interval\n"
             "/setinterval &lt;minutes&gt; — e.g. /setinterval 60\n"
             "/help — this message"
@@ -580,46 +647,75 @@ class CryptoTargetLowballStrategy(BaseStrategy):
                             except ValueError as e:
                                 reply = f"❌ {e}"
 
-                    # ---- buy price ----
-                    elif command == "/buy":
-                        reply = f"<b>[{self.name}]</b> 📉 Buy price: <b>{self.buy_price:.2f}</b>{dry_tag}"
+                    # ---- price levels ----
+                    elif command == "/levels":
+                        if not self.price_levels:
+                            reply = f"<b>[{self.name}]</b> ⚠️ No price levels configured."
+                        else:
+                            lines = [f"<b>[{self.name}]</b> 📊 Price levels ({len(self.price_levels)} total):{dry_tag}"]
+                            for i, lvl in enumerate(self.price_levels):
+                                size = round(self.order_amount_usd / lvl['buy'], 2)
+                                lines.append(
+                                    f"  [{i}] buy=<b>{lvl['buy']:.2f}</b> ({size:.2f} shares) → sell=<b>{lvl['sell']:.2f}</b>"
+                                )
+                            reply = "\n".join(lines)
 
-                    elif command == "/setbuy":
-                        if not args:
-                            reply = "❌ Usage: /setbuy &lt;price&gt;"
+                    elif command == "/addlevel":
+                        if len(args) < 2:
+                            reply = "❌ Usage: /addlevel &lt;buy&gt; &lt;sell&gt;  (e.g. /addlevel 0.03 0.15)"
                         else:
                             try:
-                                new_p = float(args[0])
-                                if not (0 < new_p < 1):
-                                    raise ValueError("must be between 0 and 1")
-                                old = self.buy_price
-                                self.buy_price = new_p
+                                bp = float(args[0])
+                                sp = float(args[1])
+                                if not (0 < bp < 1) or not (0 < sp < 1):
+                                    raise ValueError("both must be between 0 and 1")
+                                self.price_levels.append({"buy": bp, "sell": sp})
                                 self._save_config()
                                 reply = (
-                                    f"<b>[{self.name}]</b> ✅ Buy price: "
-                                    f"<b>{old:.2f}</b> → <b>{new_p:.2f}</b>{dry_tag}"
+                                    f"<b>[{self.name}]</b> ✅ Added level [{len(self.price_levels)-1}]: "
+                                    f"buy=<b>{bp:.2f}</b> → sell=<b>{sp:.2f}</b>{dry_tag}"
                                 )
                             except ValueError as e:
                                 reply = f"❌ {e}"
 
-                    # ---- sell price ----
-                    elif command == "/sell":
-                        reply = f"<b>[{self.name}]</b> 📈 Sell price: <b>{self.sell_price:.2f}</b>{dry_tag}"
-
-                    elif command == "/setsell":
+                    elif command == "/removelevel":
                         if not args:
-                            reply = "❌ Usage: /setsell &lt;price&gt;"
+                            reply = "❌ Usage: /removelevel &lt;index&gt;"
                         else:
                             try:
-                                new_p = float(args[0])
-                                if not (0 < new_p < 1):
-                                    raise ValueError("must be between 0 and 1")
-                                old = self.sell_price
-                                self.sell_price = new_p
+                                idx = int(args[0])
+                                if idx < 0 or idx >= len(self.price_levels):
+                                    raise ValueError(f"index {idx} out of range (0–{len(self.price_levels)-1})")
+                                if len(self.price_levels) == 1:
+                                    raise ValueError("cannot remove the last level")
+                                removed = self.price_levels.pop(idx)
                                 self._save_config()
                                 reply = (
-                                    f"<b>[{self.name}]</b> ✅ Sell price: "
-                                    f"<b>{old:.2f}</b> → <b>{new_p:.2f}</b>{dry_tag}"
+                                    f"<b>[{self.name}]</b> ✅ Removed level [{idx}]: "
+                                    f"buy={removed['buy']:.2f} → sell={removed['sell']:.2f}{dry_tag}"
+                                )
+                            except ValueError as e:
+                                reply = f"❌ {e}"
+
+                    elif command == "/setlevel":
+                        if len(args) < 3:
+                            reply = "❌ Usage: /setlevel &lt;index&gt; &lt;buy&gt; &lt;sell&gt;  (e.g. /setlevel 0 0.10 0.80)"
+                        else:
+                            try:
+                                idx = int(args[0])
+                                bp = float(args[1])
+                                sp = float(args[2])
+                                if idx < 0 or idx >= len(self.price_levels):
+                                    raise ValueError(f"index {idx} out of range (0–{len(self.price_levels)-1})")
+                                if not (0 < bp < 1) or not (0 < sp < 1):
+                                    raise ValueError("both prices must be between 0 and 1")
+                                old = self.price_levels[idx]
+                                self.price_levels[idx] = {"buy": bp, "sell": sp}
+                                self._save_config()
+                                reply = (
+                                    f"<b>[{self.name}]</b> ✅ Level [{idx}] updated: "
+                                    f"buy={old['buy']:.2f}→<b>{bp:.2f}</b>  "
+                                    f"sell={old['sell']:.2f}→<b>{sp:.2f}</b>{dry_tag}"
                                 )
                             except ValueError as e:
                                 reply = f"❌ {e}"
@@ -907,15 +1003,22 @@ class CryptoTargetLowballStrategy(BaseStrategy):
                 )
                 return
             await asyncio.sleep(1)
-        logger.warning(f"[{slug}] Could not capture target price — RTDS did not deliver within 30s")
+        msg = f"[{slug}] Could not capture target price — RTDS did not deliver within 30s"
+        logger.warning(msg)
+        await self._notify(f"⚠️ {msg}")
 
     # ------------------------------------------------------------------
     # Order placement on trigger
     # ------------------------------------------------------------------
 
     async def _place_close_orders(self, current_price: float) -> None:
-        size = round(self.order_amount_usd / self.buy_price, 2)
+        if not self.price_levels:
+            logger.warning("No price levels configured — nothing to place!")
+            return
 
+        levels_str = "  ".join(
+            f"buy={l['buy']:.2f}→sell={l['sell']:.2f}" for l in self.price_levels
+        )
         await self._notify(
             f"🎯 <b>TARGET MATCHED — PLACING ORDERS</b>\n"
             f"Asset: <b>{self.ticker}</b>\n"
@@ -923,21 +1026,23 @@ class CryptoTargetLowballStrategy(BaseStrategy):
             f"Target Price: <b>${self._target_price:,.2f}</b>\n"
             f"Diff: <b>${abs(current_price - self._target_price):.4f}</b> "
             f"(threshold ${self.threshold})\n"
-            f"Order: {size:.2f} shares @ {self.buy_price} (both UP & DOWN)"
+            f"Levels: {levels_str}"
         )
 
         async def place(side_name: str, token_id: str):
-            logger.info(
-                f"Placing BUY {side_name} — {size:.2f} shares @ {self.buy_price}"
-            )
-            order = await self.place_order(
-                token_id=token_id,
-                price=self.buy_price,
-                size=size,
-                side="BUY",
-            )
-            if order:
-                self._order_buy_price[order.order_id] = self.buy_price
+            for i, lvl in enumerate(self.price_levels):
+                bp = lvl["buy"]
+                sp = lvl["sell"]
+                size = round(self.order_amount_usd / bp, 2)
+                logger.info(
+                    f"Placing BUY{i+1} {side_name} — {size:.2f} shares @ {bp} (sell target: {sp})"
+                )
+                order = await self.place_order(
+                    token_id=token_id, price=bp, size=size, side="BUY",
+                )
+                if order:
+                    self._order_buy_price[order.order_id] = bp
+                    self._order_sell_price[order.order_id] = sp
 
         await asyncio.gather(
             place("UP", self.token_ids["up"]),
@@ -950,14 +1055,17 @@ class CryptoTargetLowballStrategy(BaseStrategy):
 
     async def _handle_buy_fill(self, order: OrderInfo) -> None:
         now_str = datetime.now(timezone.utc).strftime('%H:%M:%S UTC')
-        current_price = self._coingecko.get_price(self._coin_id)
-        p_str = f"${current_price:,.4f}" if current_price else "n/a"
+        current_price = self._rtds_feed.get_price()
+        p_str = f"${current_price:,.4f}" if current_price is not None else "n/a"
+
+        # Look up which sell price was planned for this specific order
+        sell_price = self._order_sell_price.get(order.order_id, self.sell_price)
 
         await self._notify(
             f"🟡 <b>BUY FILLED at {now_str}</b>\n"
             f"Token: {order.token_id[:20]}...\n"
             f"Buy price: <b>{order.price}</b>\n"
-            f"Sell target: <b>{self.sell_price}</b>\n"
+            f"Sell target: <b>{sell_price}</b>\n"
             f"Size: {order.size:.2f} shares\n"
             f"Current {self.ticker}: <b>{p_str}</b>"
         )
@@ -966,7 +1074,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
 
         sell_size = math.floor(order.size_matched * 100) / 100.0
 
-        logger.info(f"Placing SELL {sell_size:.2f} shares @ {self.sell_price}")
+        logger.info(f"Placing SELL {sell_size:.2f} shares @ {sell_price}")
 
         sell_order = None
         floored_size = math.floor((sell_size - 0.05))
@@ -974,7 +1082,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         for attempt in range(SELL_ORDER_RETRY_ATTEMPTS):
             sell_order = await self.place_order(
                 token_id=order.token_id,
-                price=self.sell_price,
+                price=sell_price,
                 size=sell_size,
                 side="SELL",
                 send_error_to_telegram=False,
@@ -989,7 +1097,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
 
             sell_order = await self.place_order(
                 token_id=order.token_id,
-                price=self.sell_price,
+                price=sell_price,
                 size=floored_size,
                 side="SELL",
                 send_error_to_telegram=(attempt == SELL_ORDER_RETRY_ATTEMPTS - 1),
@@ -1001,6 +1109,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
 
         if sell_order:
             self._order_buy_price[sell_order.order_id] = order.price
+            self._order_sell_price[sell_order.order_id] = sell_price
             logger.info(f"Sell order placed: {sell_order.order_id}")
         else:
             logger.warning(
@@ -1009,7 +1118,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
             )
             await self._notify(
                 f"⚠️ <b>SELL FAILED:</b> Could not place auto-sell for "
-                f"{order.token_id[:16]}... at {self.sell_price} "
+                f"{order.token_id[:16]}... at {sell_price} "
                 f"after {SELL_ORDER_RETRY_ATTEMPTS} retries."
             )
 
@@ -1067,8 +1176,10 @@ def run_strategy(ticker: str):
     strategy = CryptoTargetLowballStrategy(bot, ticker=ticker, params={"check_interval": 1})
 
     logger.info(f"Starting {ticker} Crypto Target Lowball Strategy...")
-    logger.info(f"Buy @ {strategy.buy_price} | Sell @ {strategy.sell_price} | "
-                f"Threshold: ${strategy.threshold}")
+    levels_str = "  ".join(
+        f"buy={l['buy']:.2f}→sell={l['sell']:.2f}" for l in strategy.price_levels
+    )
+    logger.info(f"Price levels ({len(strategy.price_levels)}): {levels_str} | Threshold: ${strategy.threshold}")
     logger.info(
         f"Trigger window: last 60s → 20s before cycle end | "
         f"Price feed: Chainlink via Polymarket RTDS ({strategy._chainlink_symbol.upper()}) "
