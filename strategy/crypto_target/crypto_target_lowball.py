@@ -65,7 +65,7 @@ STOP_ORDERS_SECONDS_BEFORE_CLOSE = 20
 # Default thresholds: how close (in USD) the current price must be to the
 # target price to trigger an order.
 DEFAULT_THRESHOLDS: Dict[str, float] = {
-    "BTC": 100.0,
+    "BTC": 15.0,
     "ETH": 1.0,
     "SOL": 0.5,
     "XRP": 0.05,
@@ -868,7 +868,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
             if target > 0:
                 diff = abs(price - target)
                 tag = "\u2705 WITHIN" if diff <= self.threshold else "\u274c outside"
-                logger.info(
+                logger.debug(
                     f"[RTDS-CL] {self._chainlink_symbol.upper()}  "
                     f"price=${price:,.4f}  "
                     f"target=${target:,.2f}  "
@@ -1155,15 +1155,15 @@ class CryptoTargetLowballStrategy(BaseStrategy):
             f"buy={l['buy']:.2f}→sell={l['sell']:.2f}" for l in self.price_levels
         )
         # Background the notification so it doesn't delay order placement by even a ms
-        asyncio.create_task(self._notify(
-            f"🎯 <b>TARGET MATCHED — PLACING ORDERS</b>\n"
-            f"Asset: <b>{self.ticker}</b>\n"
-            f"Current Price: <b>${current_price:,.4f}</b>\n"
-            f"Target Price: <b>${self._target_price:,.2f}</b>\n"
-            f"Diff: <b>${abs(current_price - self._target_price):.4f}</b> "
-            f"(threshold ${self.threshold})\n"
-            f"Levels: {levels_str}"
-        ))
+        # asyncio.create_task(self._notify(
+        #     f"🎯 <b>TARGET MATCHED — PLACING ORDERS</b>\n"
+        #     f"Asset: <b>{self.ticker}</b>\n"
+        #     f"Current Price: <b>${current_price:,.4f}</b>\n"
+        #     f"Target Price: <b>${self._target_price:,.2f}</b>\n"
+        #     f"Diff: <b>${abs(current_price - self._target_price):.4f}</b> "
+        #     f"(threshold ${self.threshold})\n"
+        #     f"Levels: {levels_str}"
+        # ))
 
         async def place(side_name: str, token_id: str):
             # API GTD security rule: submitted expiration = desired_expiry + 60s.
