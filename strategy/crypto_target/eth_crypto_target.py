@@ -2,9 +2,9 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
-from lowball.crypto_target_lowball import run_strategy
+from crypto_target_lowball import run_strategy
 
 if __name__ == "__main__":
     run_strategy("ETH")

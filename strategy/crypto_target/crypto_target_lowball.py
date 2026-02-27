@@ -149,34 +149,26 @@ class PolymarketMarketFeed:
     """
     Subscribes to the Polymarket Market WebSocket for a set of token IDs.
 
-    Tracks:
-      - best_bid / best_ask per token (from best_bid_ask events)
-      - last_trade_price per token
+    Tracks the last_trade_price for each subscribed token.
     """
 
     def __init__(self):
         self._ws = None
         self._running = False
         self._task: Optional[asyncio.Task] = None
-        # token_id → {"best_bid": float, "best_ask": float, "last_trade": float}
-        self._token_data: Dict[str, Dict[str, float]] = {}
+        # token_id → last trade price (float)
+        self._last_trade: Dict[str, Optional[float]] = {}
         self._subscribed_tokens: List[str] = []
 
-    def get_best_bid(self, token_id: str) -> Optional[float]:
-        return self._token_data.get(token_id, {}).get("best_bid")
-
-    def get_best_ask(self, token_id: str) -> Optional[float]:
-        return self._token_data.get(token_id, {}).get("best_ask")
-
     def get_last_trade(self, token_id: str) -> Optional[float]:
-        return self._token_data.get(token_id, {}).get("last_trade")
+        """Return the most recent trade price for a token, or None if unseen."""
+        return self._last_trade.get(token_id)
 
     async def subscribe(self, token_ids: List[str]) -> bool:
         """Connect to WS and subscribe to the given token IDs."""
         self._subscribed_tokens = list(token_ids)
-        # Initialize data slots
         for tid in token_ids:
-            self._token_data.setdefault(tid, {})
+            self._last_trade.setdefault(tid, None)
 
         await self.disconnect()  # close any previous connection
         return await self._connect()
@@ -188,11 +180,9 @@ class PolymarketMarketFeed:
                 websockets.connect(POLY_WS_URL), timeout=10.0
             )
             self._running = True
-            # Send subscription message
             sub_msg = json.dumps({
                 "assets_ids": self._subscribed_tokens,
                 "type": "market",
-                "custom_feature_enabled": True,   # enables best_bid_ask events
             })
             await self._ws.send(sub_msg)
             self._task = asyncio.create_task(self._read_loop())
@@ -213,7 +203,6 @@ class PolymarketMarketFeed:
                     break
                 try:
                     msgs = json.loads(raw_msg)
-                    # Polymarket sends a list of events
                     if isinstance(msgs, dict):
                         msgs = [msgs]
                     for msg in msgs:
@@ -228,44 +217,19 @@ class PolymarketMarketFeed:
     def _handle_message(self, msg: Dict[str, Any]) -> None:
         event_type = msg.get("event_type", "")
 
-        if event_type == "best_bid_ask":
+        if event_type == "last_trade_price":
             token_id = msg.get("asset_id", "")
-            if token_id not in self._token_data:
-                return
-            bid = msg.get("best_bid")
-            ask = msg.get("best_ask")
-            if bid is not None:
-                self._token_data[token_id]["best_bid"] = float(bid)
-            if ask is not None:
-                self._token_data[token_id]["best_ask"] = float(ask)
-            logger.debug(
-                f"WS best_bid_ask token={token_id[:16]}... "
-                f"bid={bid} ask={ask}"
-            )
-
-        elif event_type == "last_trade_price":
-            token_id = msg.get("asset_id", "")
-            if token_id not in self._token_data:
+            if token_id not in self._last_trade:
                 return
             price = msg.get("price")
             if price is not None:
-                self._token_data[token_id]["last_trade"] = float(price)
-            logger.debug(
-                f"WS last_trade_price token={token_id[:16]}... price={price}"
-            )
-
-        elif event_type == "price_change":
-            # price_change contains a list of per-asset changes
-            for change in msg.get("price_changes", []):
-                token_id = change.get("asset_id", "")
-                if token_id not in self._token_data:
-                    continue
-                bid = change.get("best_bid")
-                ask = change.get("best_ask")
-                if bid is not None:
-                    self._token_data[token_id]["best_bid"] = float(bid)
-                if ask is not None:
-                    self._token_data[token_id]["best_ask"] = float(ask)
+                prev = self._last_trade.get(token_id)
+                self._last_trade[token_id] = float(price)
+                logger.info(
+                    f"[WS] last_trade_price  token={token_id[:16]}...  "
+                    f"price={float(price):.4f}"
+                    + (f"  (prev={prev:.4f})" if prev is not None else "  (first trade)")
+                )
 
     async def disconnect(self) -> None:
         self._running = False
@@ -842,34 +806,57 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         # ── 2. Try to enter the current active market ─────────────────
         await self._try_enter_market()
 
-        # ── 3. Trigger logic: last-minute price check ─────────────────
-        if (
-            self.cycle_active
-            and not self._orders_placed_this_cycle
-            and self._target_price > 0
-        ):
-            in_window = (
-                now >= self.cycle_end_time - 60
-                and now < self.cycle_end_time - 20
-            )
-            if in_window:
-                current_price = self._coingecko.get_price(self._coin_id)
-                if current_price is not None:
-                    diff = abs(current_price - self._target_price)
+        # ── 3. Price + decision logging ────────────────────────────────
+        if self.cycle_active and self._target_price > 0:
+            current_price = self._coingecko.get_price(self._coin_id)
+            secs_left = max(0.0, self.cycle_end_time - now)
+            in_window = (now >= self.cycle_end_time - 60 and now < self.cycle_end_time - 20)
+
+            # Log token prices from Polymarket WS
+            token_price_parts = []
+            for side_name, token_id in self.token_ids.items():
+                tp = self._poly_ws.get_last_trade(token_id)
+                tp_str = f"{tp:.4f}" if tp is not None else "n/a"
+                token_price_parts.append(f"{side_name.upper()}={tp_str}")
+            token_price_str = "  ".join(token_price_parts) if token_price_parts else "(no WS data yet)"
+
+            if current_price is not None:
+                diff = abs(current_price - self._target_price)
+                window_tag = f"IN WINDOW ({secs_left:.0f}s left)" if in_window else f"waiting ({secs_left:.0f}s left)"
+                threshold_tag = f"✅ WITHIN threshold" if diff <= self.threshold else f"❌ outside threshold"
+                logger.info(
+                    f"[TICK] {self.ticker}  "
+                    f"CoinGecko=${current_price:,.4f}  "
+                    f"target=${self._target_price:,.2f}  "
+                    f"diff=${diff:.4f}  "
+                    f"threshold=${self.threshold}  "
+                    f"{threshold_tag}  "
+                    f"| Poly tokens: {token_price_str}  "
+                    f"| {window_tag}"
+                )
+            else:
+                logger.info(
+                    f"[TICK] {self.ticker}  "
+                    f"CoinGecko=n/a  target=${self._target_price:,.2f}  "
+                    f"| Poly tokens: {token_price_str}  "
+                    f"| {secs_left:.0f}s left"
+                )
+
+            # ── 4. Trigger: fire orders when conditions are met ─────────
+            if (
+                in_window
+                and not self._orders_placed_this_cycle
+                and current_price is not None
+            ):
+                diff = abs(current_price - self._target_price)
+                if diff <= self.threshold:
                     logger.info(
-                        f"In window — {self.ticker}: current=${current_price:,.4f}, "
-                        f"target=${self._target_price:,.4f}, "
-                        f"diff=${diff:.4f}, threshold=${self.threshold}"
+                        f"[TRIGGER] ✅ Conditions met — diff=${diff:.4f} <= ${self.threshold} "
+                        f"— placing BUY orders now!"
                     )
-                    if diff <= self.threshold:
-                        logger.info(
-                            f"✅ Threshold hit! diff={diff:.4f} <= {self.threshold} "
-                            f"— placing BUY orders"
-                        )
-                        self._orders_placed_this_cycle = True
-                        asyncio.create_task(self._place_close_orders(current_price))
-                else:
-                    logger.warning("CoinGecko price not yet available — waiting...")
+                    self._orders_placed_this_cycle = True
+                    asyncio.create_task(self._place_close_orders(current_price))
+                # (no else needed — already logged above in the TICK line)
 
     # ------------------------------------------------------------------
     # Market entry
