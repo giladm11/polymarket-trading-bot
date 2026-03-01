@@ -63,7 +63,7 @@ MARKET_DURATION = 5            # minutes per cycle
 ORDER_CANCEL_BEFORE_END = 180  # 210s - 60s offset compensation
 
 SELL_DELAY_SECONDS = 3         # wait after fill before placing sell
-SELL_ORDER_RETRY_ATTEMPTS = 7
+SELL_ORDER_RETRY_ATTEMPTS = 12
 
 # Configure logging
 logging.basicConfig(
