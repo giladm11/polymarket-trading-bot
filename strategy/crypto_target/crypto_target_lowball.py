@@ -303,6 +303,7 @@ class PolymarketRTDSFeed:
                 if raw_msg == "PING":
                     try:
                         await self._ws.send("PONG")
+                        self._last_update = time.time()
                     except Exception:
                         pass
                     continue
@@ -901,6 +902,21 @@ class CryptoTargetLowballStrategy(BaseStrategy):
     async def run(self, token_ids: List[str] = None, duration: int = None):
         await self.initialize()
 
+        async def _ws_health_check_loop():
+            # Check every 30 seconds that we are still receiving info from the websocket
+            while self.status == StrategyStatus.RUNNING:
+                await asyncio.sleep(30)  # 30 seconds
+                now = time.time()
+                # If no update (price or ping) for 30 seconds, restart it
+                if self._rtds_feed._last_update > 0 and (now - self._rtds_feed._last_update) >= 30:
+                    logger.warning("[HEALTH] No RTDS ws data for 30 seconds. Restarting...")
+                    if self.telegram:
+                        await self._notify("⚠️ <b>RTDS Health Check:</b> No data received for 30s. Restarting stream...")
+                    await self._rtds_feed.disconnect()
+                    # small wait to let it unbind
+                    await asyncio.sleep(2)
+                    await self._rtds_feed.connect()
+
         async def _strategy_loop():
             start_time = time.time()
             try:
@@ -925,6 +941,7 @@ class CryptoTargetLowballStrategy(BaseStrategy):
         await asyncio.gather(
             _strategy_loop(),
             self._handle_telegram_commands(),
+            _ws_health_check_loop(),
         )
 
     # ------------------------------------------------------------------
