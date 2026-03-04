@@ -176,6 +176,10 @@ class BaseLowballStrategy(BaseStrategy):
             float(os.environ.get("ORDER_AMOUNT_USD", "2"))
         )
 
+        # Buy prices
+        loaded_prices = self._load_config_value("buy_prices", BUY_PRICES)
+        self.buy_prices = [float(p) for p in loaded_prices]
+
         # Sell targets
         loaded_targets = self._load_config_value("sell_targets", SELL_TARGETS)
         self.sell_targets = [float(t) for t in loaded_targets]
@@ -248,6 +252,7 @@ class BaseLowballStrategy(BaseStrategy):
                 except Exception:
                     pass
             data["lowball_order_amount_usd"] = self.order_amount_usd
+            data["buy_prices"] = self.buy_prices
             data["sell_targets"] = self.sell_targets
             data["balance_report_interval"] = self.balance_report_interval
             self.config_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -343,14 +348,16 @@ class BaseLowballStrategy(BaseStrategy):
             return
 
         dry_tag = " <i>[DRY RUN]</i>" if self.dry_run else ""
-        num_levels = len(BUY_PRICES)
-        prices_str = " / ".join(str(p) for p in BUY_PRICES)
+        num_levels = len(self.buy_prices)
+        prices_str = " / ".join(str(p) for p in self.buy_prices)
         HELP = (
             f"\U0001f916 <b>[{self.name}] Available commands:</b>\n"
             "/balance — current USDC balance\n"
             "/size — current order size per price level\n"
             f"/setsize &lt;amount&gt; — set order size per level (e.g. /setsize 2)\n"
             f"  ({num_levels} levels × 2 sides = {num_levels * 2} orders, prices: {prices_str})\n"
+            "/prices — current buy prices\n"
+            "/setprices &lt;p1&gt; &lt;p2&gt; ... — set buy prices (e.g. /setprices 0.15 0.10 0.05 0.02)\n"
             "/targets — current sell targets\n"
             "/settargets &lt;t1&gt; &lt;t2&gt; ... — set targets (e.g. /settargets 0.20 0.25 0.30)\n"
             "/interval — current balance report interval\n"
@@ -380,7 +387,7 @@ class BaseLowballStrategy(BaseStrategy):
                         reply = f"<b>[{self.name}]</b> \U0001f4b0 Current balance: <b>${balance:.2f} USDC</b>{dry_tag}"
 
                     elif command == "/size":
-                        num = len(BUY_PRICES)
+                        num = len(self.buy_prices)
                         total = self.order_amount_usd * num * 2
                         reply = (
                             f"<b>[{self.name}]</b> \U0001f4d0 Current order size: <b>${self.order_amount_usd:.2f} USD</b> per level\n"
@@ -432,6 +439,35 @@ class BaseLowballStrategy(BaseStrategy):
                             except ValueError as e:
                                 reply = f"\u274c Invalid value: {e}"
 
+                    elif command == "/prices":
+                        prices_str = " / ".join(str(p) for p in self.buy_prices)
+                        reply = (
+                            f"<b>[{self.name}]</b> \U0001f4c8 Current buy prices:\n"
+                            f"<b>{prices_str}</b>\n"
+                            f"({len(self.buy_prices)} levels){dry_tag}"
+                        )
+
+                    elif command == "/setprices":
+                        if not args:
+                            reply = "\u274c Usage: /setprices &lt;p1&gt; &lt;p2&gt; ...  (e.g. /setprices 0.15 0.10 0.05)"
+                        else:
+                            try:
+                                new_prices = [float(x) for x in args]
+                                if any(p <= 0 or p >= 1 for p in new_prices):
+                                    raise ValueError("prices must be between 0 and 1")
+                                old_str = " / ".join(str(p) for p in self.buy_prices)
+                                self.buy_prices = new_prices
+                                self._save_config()
+                                new_str = " / ".join(str(p) for p in self.buy_prices)
+                                logger.info(f"Buy prices changed via Telegram: {old_str} -> {new_str}")
+                                reply = (
+                                    f"<b>[{self.name}]</b> \u2705 Buy prices updated:\n"
+                                    f"<b>{old_str}</b> \u2192 <b>{new_str}</b>\n"
+                                    f"({len(self.buy_prices)} levels){dry_tag}"
+                                )
+                            except ValueError as e:
+                                reply = f"\u274c Invalid prices: {e}"
+
                     elif command == "/targets":
                         targets_str = " / ".join(str(t) for t in self.sell_targets)
                         reply = (
@@ -464,7 +500,7 @@ class BaseLowballStrategy(BaseStrategy):
                     elif command == "/levels":
                         targets_str = " / ".join(str(t) for t in self.sell_targets)
                         lines = [f"<b>[{self.name}]</b> \U0001f4ca <b>Price levels:</b>"]
-                        for bp in BUY_PRICES:
+                        for bp in self.buy_prices:
                             cost = round(self.order_amount_usd / bp, 2)
                             lines.append(f"  Buy @ <b>{bp}</b> → Sell targets: <b>{targets_str}</b> (size ≈ {cost} shares)")
                         reply = "\n".join(lines) + dry_tag
@@ -653,8 +689,8 @@ class BaseLowballStrategy(BaseStrategy):
             # GTD expiration: orders expire 3.5 min before cycle end
             gtd_expiration = int(cycle_end) - ORDER_CANCEL_BEFORE_END
 
-            # Total cost = order_amount_usd per price level × 4 levels × 2 sides
-            total_cost = sum(order_amount_usd for _ in BUY_PRICES) * 2
+            # Total cost = order_amount_usd per price level × levels × 2 sides
+            total_cost = sum(order_amount_usd for _ in self.buy_prices) * 2
 
             # Pre-flight balance check
             if not self.dry_run:
@@ -663,7 +699,7 @@ class BaseLowballStrategy(BaseStrategy):
                     warn_msg = (
                         f"Insufficient balance: ${balance:.2f} available, "
                         f"${total_cost:.2f} required "
-                        f"(${order_amount_usd:.2f} × {len(BUY_PRICES)} levels × 2 sides). "
+                        f"(${order_amount_usd:.2f} × {len(self.buy_prices)} levels × 2 sides). "
                         f"Skipping cycle."
                     )
                     logger.warning(warn_msg)
@@ -675,18 +711,18 @@ class BaseLowballStrategy(BaseStrategy):
 
                 logger.info(
                     f"Balance OK: ${balance:.2f} available, ${total_cost:.2f} required. "
-                    f"Placing {len(BUY_PRICES) * 2} buy orders ({len(BUY_PRICES)} levels × 2 sides)."
+                    f"Placing {len(self.buy_prices) * 2} buy orders ({len(self.buy_prices)} levels × 2 sides)."
                 )
             else:
                 logger.info(
-                    f"[DRY RUN] Simulating {len(BUY_PRICES) * 2} buy orders "
-                    f"(${order_amount_usd:.2f} per level × {len(BUY_PRICES)} levels × 2 sides = ${total_cost:.2f})"
+                    f"[DRY RUN] Simulating {len(self.buy_prices) * 2} buy orders "
+                    f"(${order_amount_usd:.2f} per level × {len(self.buy_prices)} levels × 2 sides = ${total_cost:.2f})"
                 )
 
             # Place buy orders on both UP and DOWN tokens for each price level
             new_order_ids: List[str] = []
             for side_name, token_id in [("UP", token_ids["up"]), ("DOWN", token_ids["down"])]:
-                for buy_price in BUY_PRICES:
+                for buy_price in self.buy_prices:
                     size = round(order_amount_usd / buy_price, 2)
                     logger.info(
                         f"Placing BUY {side_name} {size:.2f} shares @ {buy_price} "
@@ -897,7 +933,7 @@ def run_strategy(ticker: str):
     strategy = BaseLowballStrategy(bot, ticker=ticker, params={"check_interval": 1})
 
     logger.info(f"Starting {ticker} Lowball Grid Strategy (Forever)...")
-    logger.info(f"Buy levels: {BUY_PRICES}")
+    logger.info(f"Buy levels: {strategy.buy_prices}")
     logger.info(f"Sell targets: {strategy.sell_targets}")
     logger.info(f"Orders cancel at: cycle_end − {ORDER_CANCEL_BEFORE_END}s (3.5 min before end)")
 
